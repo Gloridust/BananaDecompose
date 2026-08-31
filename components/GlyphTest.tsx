@@ -13,8 +13,8 @@ const H = 260
 
 type Case = {
   name: string
-  truth: { text: string; family: string; weight: number; size: number; color: string; x: number; y: number }
-  measured: { size: number; color: string; dx: number; dy: number; dw: number; dh: number } | null
+  truth: { text: string; family: string; weight: number; size: number; color: string; x: number; y: number; fitWith?: string }
+  measured: { size: number; color: string; dx: number; dy: number; dw: number; dh: number; overflowX: number } | null
   fontPick: { family: string; score: number; widthFit: number; edgeIou: number; decisive: boolean } | null
   source: string
   overlay: string
@@ -86,18 +86,54 @@ function overlay(src: string, truth: Case['truth'], fit: ReturnType<typeof fitTe
 }
 
 const TRUTHS: Case['truth'][] = [
+  // Deliberately mismatched: measured from a very condensed face, fitted with a
+  // wide one. Latin, because Bebas has no CJK glyphs and a fallback would erase
+  // the very difference this case exists to reproduce — the shape that sent a
+  // brush title 40% past its own box.
+  { text: 'MORNING', family: 'Bebas Neue', weight: 400, size: 140, color: '#241a10', x: 80, y: 50, fitWith: 'Georgia' },
   { text: '晨间萃取', family: 'Noto Serif SC', weight: 700, size: 96, color: '#3a2416', x: 90, y: 60 },
   { text: '周六 9:00 · 三号仓库', family: 'Noto Sans SC', weight: 500, size: 46, color: '#5a4023', x: 70, y: 100 },
   { text: 'MORNING EXTRACTION', family: 'Bebas Neue', weight: 400, size: 78, color: '#241a10', x: 60, y: 80 },
 ]
 
+/** How far the fitted setting spills past the ink box it was fitted to. */
+function fitOverflow(
+  text: string,
+  family: string,
+  weight: number,
+  fit: ReturnType<typeof fitText>,
+  target: { x: number; y: number; w: number; h: number },
+) {
+  const { ctx } = ctxOf(8, 8)
+  ctx.font = `${weight} ${fit.fontSize}px ${fontStack(family)}`
+  ctx.textBaseline = 'top'
+  ;(ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = `${fit.letterSpacing}px`
+  const m = ctx.measureText(text)
+  const inkW = m.actualBoundingBoxLeft + m.actualBoundingBoxRight
+  return Math.max(0, inkW - target.w)
+}
+
 export default function GlyphTest() {
   const [cases, setCases] = useState<Case[]>([])
   const [busy, setBusy] = useState(false)
   const [fontsMissing, setFontsMissing] = useState<string[]>([])
+  const [crash, setCrash] = useState<string | null>(null)
 
   const run = useCallback(async () => {
     setBusy(true)
+    setCrash(null)
+    try {
+      await runInner()
+    } catch (err) {
+      // A self-test that fails silently is worse than no self-test: it reads as
+      // "nothing to report" when it means "the check never ran".
+      setCrash(`${(err as Error).name}: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }, [])
+
+  const runInner = useCallback(async () => {
     // Web fonts must be genuinely fetched, not merely 'ready' — see ensureFonts.
     await ensureFonts(
       [...FONT_CANDIDATES, ...TRUTHS.map((t) => ({ family: t.family, weight: t.weight }))],
@@ -129,12 +165,14 @@ export default function GlyphTest() {
 
       const ranked = await scoreFonts(truth.text, FONT_CANDIDATES, ink, false)
       const best = ranked[0]
-      const fit = fitText(truth.text, truth.family, truth.weight, false, ink.box)
+      const fitFamily = truth.fitWith ?? truth.family
+      const fit = fitText(truth.text, fitFamily, truth.weight, false, ink.box)
 
       out.push({
         name: truth.text,
         truth,
         measured: {
+          overflowX: fitOverflow(truth.text, fitFamily, truth.weight, fit, ink.box),
           size: fit.fontSize,
           color: ink.color,
           dx: ink.box.x - inkBox.x,
@@ -146,12 +184,11 @@ export default function GlyphTest() {
           ? { family: best.family, score: best.score, widthFit: best.widthFit, edgeIou: best.edgeIou, decisive: scoreMargin(ranked) >= 0.06 }
           : null,
         source: src,
-        overlay: await overlay(src, truth, fit, truth.family, truth.weight),
+        overlay: await overlay(src, truth, fit, fitFamily, truth.weight),
       })
     }
 
     setCases(out)
-    setBusy(false)
   }, [])
 
   useEffect(() => {
@@ -176,6 +213,12 @@ export default function GlyphTest() {
         红色是恢复出来的层叠在原图上 —— 完全重合就说明对齐了，双影就是没对上。
       </p>
 
+      {crash ? (
+        <p className="mb-3 rounded border border-rose-500/50 bg-rose-500/10 px-2.5 py-2 font-mono text-[11px] leading-relaxed text-rose-200">
+          自检本身崩了：{crash}
+        </p>
+      ) : null}
+
       {fontsMissing.length ? (
         <p className="mb-3 rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-[11px] leading-relaxed text-amber-200">
           ⚠ 这些字体没能加载：{fontsMissing.join('、')}。测量会退回系统 fallback 的度量，下面的数字不作数。
@@ -185,7 +228,9 @@ export default function GlyphTest() {
 
       <div className="space-y-3">
         {cases.map((c) => {
-          const ok = c.measured && Math.abs(c.measured.dx) <= 2 && Math.abs(c.measured.dy) <= 2
+          // Overflow is the failure that matters: a setting wider than the ink it
+          // replaced lands on top of whatever sits next to it.
+          const ok = c.measured && Math.abs(c.measured.dx) <= 2 && Math.abs(c.measured.dy) <= 2 && c.measured.overflowX <= 1
           return (
             <article key={c.name} className="rounded-lg border border-ink-800 bg-ink-900 p-3">
               <div className="mb-2 flex flex-wrap items-baseline gap-x-4 gap-y-1 font-mono text-[10px]">
@@ -202,6 +247,7 @@ export default function GlyphTest() {
                     <Stat k="字号真值" v={`${c.truth.size}px`} />
                     <Stat k="量出" v={`${c.measured.size.toFixed(1)}px`} />
                     <Stat k="位置偏差" v={`${c.measured.dx.toFixed(1)}, ${c.measured.dy.toFixed(1)}px`} />
+                    <Stat k="溢出" v={`${c.measured.overflowX.toFixed(1)}px`} />
                     <Stat k="尺寸偏差" v={`${c.measured.dw.toFixed(1)}, ${c.measured.dh.toFixed(1)}px`} />
                     <Stat k="颜色真值" v={c.truth.color} />
                     <Stat k="量出" v={c.measured.color} />

@@ -260,6 +260,8 @@ export type BoardMeta = {
 export type Board = BoardMeta & {
   branches: BoardBranch[]
   nodes: BoardNode[]
+  /** Interleaved step log across every branch, kept for diagnosis. */
+  steps?: RunStep[]
 }
 
 // ---------- API wire types ----------

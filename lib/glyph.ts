@@ -121,6 +121,38 @@ function hex(r: number, g: number, b: number) {
 }
 
 /**
+ * Does the split look like one filled shape rather than a row of glyphs?
+ *
+ * Glyphs leave a broken profile — every column between strokes drops to nothing.
+ * A plaque or ribbon is solid all the way across. Scanning the column profile
+ * separates the two without needing connected components.
+ */
+function looksLikeContainer(
+  dist: Uint8ClampedArray,
+  threshold: number,
+  w: number,
+  h: number,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number,
+) {
+  const bw = maxX - minX + 1
+  const bh = maxY - minY + 1
+  if (bw < 8 || bh < 8) return false
+
+  let solidColumns = 0
+  for (let x = minX; x <= maxX; x++) {
+    let col = 0
+    for (let y = minY; y <= maxY; y++) if (dist[y * w + x] > threshold) col++
+    if (col / bh > 0.85) solidColumns++
+  }
+
+  // Nearly every column running floor to ceiling is a filled shape, not type.
+  return solidColumns / bw > 0.7
+}
+
+/**
  * Measure the actual glyph pixels inside a coarse box.
  *
  * The model's box only has to be roughly right: it gets padded, the local
@@ -132,7 +164,7 @@ function hex(r: number, g: number, b: number) {
 export async function extractInk(
   src: string,
   box: [number, number, number, number],
-  opts: { pad?: number } = {},
+  opts: { pad?: number; retry?: boolean } = {},
 ): Promise<InkMetrics | null> {
   const pad = opts.pad ?? 0.2
   const img = await loadImage(src)
@@ -225,6 +257,16 @@ export async function extractInk(
   // A split that claims almost nothing or almost everything did not find type.
   if (density < 0.004 || density > 0.75) return null
 
+  // Type set inside a badge or ribbon defeats the border-ring assumption: the
+  // padding reaches past the container, so the container's own fill scores as
+  // far-from-background and the whole plaque comes back as one glyph-shaped
+  // blob. Observed on a cream ribbon over dark wood — the recovered "text" was
+  // the ribbon. Retry from inside the container when the split looks like one.
+  if (!opts.retry && looksLikeContainer(dist, t, sw, sh, minX, minY, maxX, maxY)) {
+    const inner = await extractInk(src, box, { ...opts, pad: -0.06, retry: true })
+    if (inner) return inner
+  }
+
   const bw2 = maxX - minX + 1
   const bh2 = maxY - minY + 1
 
@@ -267,11 +309,18 @@ export async function extractInk(
 export type TextFit = {
   fontSize: number
   letterSpacing: number
-  /** Layer box that lands the rendered ink exactly on the measured ink. */
+  /** Layer box that lands the rendered ink on the measured ink. */
   x: number
   y: number
   w: number
   h: number
+  /**
+   * How far the substitute face's proportions are from the original's, as
+   * heightScale / widthScale. Well above 1 means the original is condensed
+   * relative to the replacement — a brush title against a text face — and the
+   * fit had to shrink to avoid overflowing.
+   */
+  aspectMismatch: number
 }
 
 function measure(
@@ -316,8 +365,17 @@ export function fitText(
   const probe = 100
 
   const base = measure(ctx, text, family, weight, italic, probe, 0)
-  // Ink height scales linearly with font size, so one probe pins the scale.
-  let size = base.inkH > 0 ? (probe * target.h) / base.inkH : target.h
+
+  // Both dimensions scale linearly with size, so one probe pins both candidates.
+  const byHeight = base.inkH > 0 ? (probe * target.h) / base.inkH : target.h
+  const byWidth = base.inkW > 0 ? (probe * target.w) / base.inkW : byHeight
+  const aspectMismatch = byWidth > 0 ? byHeight / byWidth : 1
+
+  // Take the smaller: a substitute face whose glyphs are wider than the original
+  // must shrink to fit the space the original occupied. Scaling on height alone
+  // sent a brush title 40% past its own box, and negative tracking bottomed out
+  // long before it could pull that back.
+  let size = Math.min(byHeight, byWidth)
   size = Math.min(Math.max(size, 4), 2000)
 
   // Tracking closes whatever width gap the face's own advances leave behind.
@@ -330,15 +388,21 @@ export function fitText(
 
   const final = measure(ctx, text, family, weight, italic, size, letterSpacing)
 
+  // Centre whatever the fit could not fill, so a shorter substitute sits in the
+  // middle of the space the original held instead of hugging its top-left.
+  const slackX = Math.max(0, target.w - final.inkW) / 2
+  const slackY = Math.max(0, target.h - final.inkH) / 2
+
   return {
     fontSize: size,
     letterSpacing,
+    aspectMismatch,
     // With textBaseline 'top' the ink sits below the alignment point, so the box
     // origin is the ink origin shifted back by the face's own bearings.
-    x: target.x + final.left,
-    y: target.y + final.ascent,
-    w: Math.max(final.inkW, target.w) * 1.02,
-    h: Math.max(final.inkH, target.h) * 1.6,
+    x: target.x + slackX + final.left,
+    y: target.y + slackY + final.ascent,
+    w: Math.max(final.inkW, 1) * 1.04,
+    h: Math.max(final.inkH, 1) * 1.35,
   }
 }
 

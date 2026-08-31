@@ -178,9 +178,21 @@ export default function SelfTest() {
   const [editing, setEditing] = useState<Scene | null>(null)
   const [bundle, setBundle] = useState<{ entries: { path: string; size: number; crcOk: boolean }[]; totalBytes: number } | null>(null)
   const [bundleError, setBundleError] = useState<string | null>(null)
+  const [crash, setCrash] = useState<string | null>(null)
 
   const run = useCallback(async () => {
     setBusy(true)
+    setCrash(null)
+    try {
+      await runInner()
+    } catch (err) {
+      setCrash(`${(err as Error).name}: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }, [])
+
+  const runInner = useCallback(async () => {
     const truth = groundTruth()
     const truthSrc = truthUrl(truth)
     const results: Case[] = []
@@ -197,7 +209,6 @@ export default function SelfTest() {
 
     setCases(results)
     setDemoBoard(syntheticBoard(truthSrc))
-    setBusy(false)
   }, [])
 
   useEffect(() => {
@@ -236,6 +247,12 @@ export default function SelfTest() {
       ) : null}
 
       <GlyphTest />
+
+      {crash ? (
+        <p className="mb-4 rounded border border-rose-500/50 bg-rose-500/10 px-2.5 py-2 font-mono text-[11px] leading-relaxed text-rose-200">
+          自检本身崩了：{crash}
+        </p>
+      ) : null}
 
       {demoBoard ? (
         <section className="mb-6">

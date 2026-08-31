@@ -166,7 +166,7 @@ export async function buildDiagnosticBundle(
       board.nodes.find((n) => n.id === branch.sceneNodeId && n.scene) ??
       board.nodes.find((n) => n.kind === 'scene' && n.scene && n.branches.includes(branch.id))
     if (!node?.scene) continue
-    const dir = `${root}/scenes/${safeName(branch.label, branch.id)}`
+    const dir = `${root}/scenes/${safeName(branch.id.replace(/[:]/g, '-'), 'branch')}`
     const scene: Scene = node.scene
 
     const layerDescriptions: unknown[] = []
@@ -230,7 +230,7 @@ export async function buildDiagnosticBundle(
       id: board.id,
       createdAt: new Date(board.createdAt).toISOString(),
       prompt: board.prompt,
-      rounds: board.rounds,
+      rounds: board.rounds ?? 1,
       fromUpload: board.fromUpload,
       concurrency: board.concurrency,
       models: board.models,
@@ -259,6 +259,29 @@ export async function buildDiagnosticBundle(
     userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : undefined,
   }
   entries.push(textEntry(`${root}/manifest.json`, JSON.stringify(manifest, null, 2)))
+
+  // One line per step, including the ones that reported a reason for producing
+  // nothing — a node can only say that it is empty, not why.
+  if (board.steps?.length) {
+    entries.push(
+      textEntry(
+        `${root}/steps.log`,
+        board.steps
+          .map((s) => {
+            const parts = [
+              s.status.toUpperCase().padEnd(8),
+              s.ms != null ? `${(s.ms / 1000).toFixed(1)}s`.padStart(7) : '      -',
+              s.cost ? `$${s.cost.toFixed(4)}` : '        ',
+              s.label,
+            ]
+            if (s.detail) parts.push(`— ${s.detail}`)
+            if (s.error) parts.push(`!! ${s.error}`)
+            return parts.join('  ')
+          })
+          .join('\n'),
+      ),
+    )
+  }
   entries.push(textEntry(`${root}/graph.json`, JSON.stringify({ nodes: nodeIndex }, null, 2)))
   entries.push(textEntry(`${root}/README.md`, readme(board, opts)))
 
@@ -284,7 +307,7 @@ function readme(board: Board, opts: BundleOptions) {
 
 提示词：**${board.prompt}**
 
-- 画布 \`${board.id}\`，${board.rounds} 轮，${board.branches.length} 条分支，${board.nodes.length} 个节点
+- 画布 \`${board.id}\`，${board.rounds ?? 1} 轮，${board.branches.length} 条分支，${board.nodes.length} 个节点
 - 墙钟 ${(board.totalMs / 1000).toFixed(1)}s（串行等价 ${(board.serialMs / 1000).toFixed(1)}s），成本 $${board.totalCost.toFixed(4)}
 - 模型：出图 \`${board.models.image}\` / 视觉 \`${board.models.vision}\` / grounding \`${board.models.grounding}\`
 - 图片${opts.maxDim ? `最长边缩到 ${opts.maxDim}px` : '为原始分辨率'}；**带透明的一律是 PNG**，不透明的转 JPEG

@@ -153,6 +153,9 @@ export async function recoverText(
       provenance: [
         '字形贴合',
         `字号 ${fit.fontSize.toFixed(1)}px 由墨迹量出`,
+        fit.aspectMismatch > 1.25
+          ? `原字比替换字体窄 ${((fit.aspectMismatch - 1) * 100).toFixed(0)}%（多半是书法/美术字），已按不溢出缩放，会比原字矮`
+          : '',
         `颜色 ${ink.color} 取自笔画像素`,
         decisive ? `字体 ${best.family} 由渲染回测选出` : `字体 ${best.family} 取自模型判断（回测不够分辨）`,
         refinedCount && content !== t.content ? `裁图复核改写为「${content}」` : '',

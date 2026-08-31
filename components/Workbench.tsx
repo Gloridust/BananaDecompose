@@ -447,6 +447,9 @@ export default function Workbench() {
           totalMs: (existing?.totalMs ?? 0) + Math.round(performance.now() - boardStart),
           serialMs: prepMs + finishedBoard.branches.reduce((a, b) => a + b.ms, 0),
           totalCost: prepTotals.cost + finishedBoard.branches.reduce((a, b) => a + b.cost, 0),
+          // Nodes record what a step produced; only the log records why one
+          // produced nothing, which is exactly what a failed run needs.
+          steps: stepsRef.current,
         }
         commit(finished)
         await saveBoard(finished).catch(() => undefined)

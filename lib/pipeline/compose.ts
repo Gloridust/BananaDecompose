@@ -1,6 +1,6 @@
 'use client'
 
-import { chromaKeyMatte, cropBox, downscale, dualRenderMatte, imageSize, maskMatte, type MatteResult } from '../matte'
+import { MatteError, chromaKeyMatte, cropBox, downscale, dualRenderMatte, imageSize, maskMatte, type MatteResult } from '../matte'
 import type {
   ComposeOptions,
   ImageLayer,
@@ -244,7 +244,16 @@ export async function runCompose(
           ctx.onArtifact({ label: `${el.name} · 黑底`, src: black.images[0], role: 'raw' })
           pushRaw(`${el.name} · 白底`, white.images[0])
           pushRaw(`${el.name} · 黑底`, black.images[0])
-          matte = await dualRenderMatte(white.images[0], black.images[0])
+
+          try {
+            matte = await dualRenderMatte(white.images[0], black.images[0])
+          } catch (err) {
+            if (!(err instanceof MatteError)) throw err
+            // Solving alpha is impossible, but the white plate is still a usable
+            // subject-on-light-ground, so key it rather than lose the element.
+            degraded = err.message
+            matte = await chromaKeyMatte(white.images[0], { key: [255, 255, 255], near: 24, far: 64 })
+          }
         } else if (opts.matte === 'chroma') {
           const res = await gen(ctx, { prompt: elementPrompt(el.prompt, 'magenta'), aspectRatio: '1:1', resolution: opts.resolution, model: models.image, seed: 1000 + i })
           usage.cost = res.usage.cost

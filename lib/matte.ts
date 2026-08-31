@@ -71,6 +71,16 @@ export async function dualRenderMatte(
   const white = await dataOf(whiteSrc)
   const black = await dataOf(blackSrc, white.width, white.height)
 
+  // The whole method assumes the model actually rendered the two backdrops it
+  // was asked for. It often does not — observed: a subject asked for on pure
+  // black came back on white. Then Cw ≈ Cb, alpha solves to 1 everywhere, and
+  // the result is an opaque rectangle with no error anywhere. Checking the
+  // corners costs nothing and turns that silent write-off into a reported one.
+  const check = backdropCheck(white, black)
+  if (!check.usable) {
+    throw new MatteError(check.reason, check)
+  }
+
   const out = new ImageData(white.width, white.height)
   const W = white.data
   const B = black.data
@@ -103,6 +113,70 @@ export async function dualRenderMatte(
 }
 
 // -------------------------------------------------------- chroma key
+
+export class MatteError extends Error {
+  constructor(message: string, readonly detail: BackdropCheck) {
+    super(message)
+    this.name = 'MatteError'
+  }
+}
+
+export type BackdropCheck = {
+  usable: boolean
+  reason: string
+  whiteLuma: number
+  blackLuma: number
+  separation: number
+}
+
+/** Median luma of the frame's corners, where the backdrop should be showing. */
+function cornerLuma(data: ImageData) {
+  const { width, height, data: D } = data
+  const size = Math.max(4, Math.round(Math.min(width, height) * 0.06))
+  const samples: number[] = []
+
+  for (const [ox, oy] of [
+    [0, 0],
+    [width - size, 0],
+    [0, height - size],
+    [width - size, height - size],
+  ]) {
+    for (let y = oy; y < oy + size; y += 2) {
+      for (let x = ox; x < ox + size; x += 2) {
+        const i = (y * width + x) * 4
+        samples.push((D[i] * 0.299 + D[i + 1] * 0.587 + D[i + 2] * 0.114) / 255)
+      }
+    }
+  }
+  samples.sort((a, b) => a - b)
+  return samples[Math.floor(samples.length / 2)] ?? 0
+}
+
+function backdropCheck(white: ImageData, black: ImageData): BackdropCheck {
+  const whiteLuma = cornerLuma(white)
+  const blackLuma = cornerLuma(black)
+  const separation = whiteLuma - blackLuma
+
+  // Two obedient renders separate by nearly the full range; anything under half
+  // means at least one backdrop is not what was asked for, and the solved alpha
+  // would be meaningless.
+  if (separation < 0.5) {
+    const culprit =
+      whiteLuma < 0.75 && blackLuma < 0.25
+        ? '白底那张不是白的'
+        : whiteLuma > 0.75 && blackLuma > 0.25
+          ? '黑底那张不是黑的'
+          : '两张底色都不对'
+    return {
+      usable: false,
+      reason: `双渲染底色校验失败：${culprit}（白底亮度 ${whiteLuma.toFixed(2)}，黑底亮度 ${blackLuma.toFixed(2)}，需要相差 0.5 以上）。模型没按指令换底，解出的 alpha 会是整块不透明。`,
+      whiteLuma,
+      blackLuma,
+      separation,
+    }
+  }
+  return { usable: true, reason: '', whiteLuma, blackLuma, separation }
+}
 
 /** Distance-based key with spill suppression. Default key is pure magenta. */
 export async function chromaKeyMatte(
