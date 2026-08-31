@@ -38,6 +38,7 @@ export type ComposeResult = {
   background: string
   /** Board nodes the assembled scene descends from. */
   tailNodes: string[]
+  warnings: string[]
 }
 
 /** Shared upstream, step 1. Every compose branch consumes the same plan. */
@@ -441,6 +442,14 @@ export async function runCompose(
   const elements = elementLayers.filter((l): l is ImageLayer => Boolean(l))
   const layers: Layer[] = [background, ...elements, ...textLayers]
 
+  const warnings: string[] = []
+  if (elements.length < plan.elements.length) {
+    warnings.push(`${plan.elements.length - elements.length} 个元素渲染失败`)
+  }
+  if (bakeText && backgroundSrc === bgSrc && textLayers.length) {
+    warnings.push('擦除被拒，背景仍带原文字，重排文字会重影')
+  }
+
   return {
     scene: {
       canvas: { width, height, background: hexOr(plan.background.dominantColor, '#111114') },
@@ -449,6 +458,7 @@ export async function runCompose(
     plan,
     background: bgSrc,
     tailNodes,
+    warnings,
   }
 }
 

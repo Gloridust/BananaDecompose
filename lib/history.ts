@@ -73,11 +73,35 @@ export function newId() {
 
 const SETTINGS_KEY = 'bd:settings'
 
+/**
+ * Merge one level into nested option objects.
+ *
+ * A top-level spread would let a stored `decompose` block wholly replace the
+ * default one, so every option added after that block was written comes back
+ * `undefined` — silently off, with the UI showing the stale shape as if it were
+ * a deliberate choice. Anything genuinely new has to inherit its default.
+ */
+function mergeSettings<T>(base: T, stored: unknown): T {
+  if (!stored || typeof stored !== 'object') return base
+  const out = { ...(base as Record<string, unknown>) }
+
+  for (const [key, value] of Object.entries(stored as Record<string, unknown>)) {
+    const fallback = (base as Record<string, unknown>)[key]
+    const bothPlainObjects =
+      fallback && typeof fallback === 'object' && !Array.isArray(fallback) &&
+      value && typeof value === 'object' && !Array.isArray(value)
+    out[key] = bothPlainObjects
+      ? { ...(fallback as object), ...(value as object) }
+      : value
+  }
+  return out as T
+}
+
 export function loadSettings<T>(fallback: T): T {
   if (typeof window === 'undefined') return fallback
   try {
     const raw = window.localStorage.getItem(SETTINGS_KEY)
-    return raw ? { ...fallback, ...JSON.parse(raw) } : fallback
+    return raw ? mergeSettings(fallback, JSON.parse(raw)) : fallback
   } catch {
     return fallback
   }

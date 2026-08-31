@@ -191,6 +191,7 @@ export default function Workbench() {
       try {
         let scene: Scene
         let tailNodes: string[]
+        let warnings: string[]
 
         if (plan.pipeline === 'compose') {
           const res = await runCompose(ctx, settings.prompt, plan.compose, models, {
@@ -199,6 +200,7 @@ export default function Workbench() {
           })
           scene = res.scene
           tailNodes = res.tailNodes
+          warnings = res.warnings
         } else {
           const res = await runDecompose(
             ctx,
@@ -208,6 +210,7 @@ export default function Workbench() {
           )
           scene = res.scene
           tailNodes = res.tailNodes
+          warnings = res.warnings
         }
 
         const metrics = await computeMetrics(scene, collectedArtifacts, {
@@ -223,6 +226,7 @@ export default function Workbench() {
           kind: 'scene',
           label: plan.label,
           detail: `${scene.layers.length} 层 · ${scene.layers.filter((l) => l.type === 'text').length} 文字`,
+          error: warnings.length ? warnings.join('；') : undefined,
           inputs: tailNodes,
           status: 'ok',
           ms: pathMs,

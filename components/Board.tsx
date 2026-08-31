@@ -291,7 +291,19 @@ function NodeCard({
             {node.detail}
           </p>
         ) : null}
-        {node.error ? <p className="mt-0.5 line-clamp-2 text-[9px] leading-snug text-rose-400">{node.error}</p> : null}
+        {node.error ? (
+          // A finished node carrying a message is reporting a degradation, not a
+          // failure — amber, so a real error stays visually distinct.
+          <p
+            className={`mt-0.5 line-clamp-3 text-[9px] leading-snug ${
+              node.status === 'ok' ? 'text-amber-400' : 'text-rose-400'
+            }`}
+            title={node.error}
+          >
+            {node.status === 'ok' ? '⚠ ' : ''}
+            {node.error}
+          </p>
+        ) : null}
 
         <div className="mt-1.5 min-h-0 flex-1">
           {isScene && node.scene ? (

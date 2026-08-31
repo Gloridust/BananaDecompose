@@ -17,7 +17,7 @@ const SEG_CONCURRENCY = 8
  * masks, and the image model does the inpainting that a local LaMa would do.
  * Ceiling is roughly PSNR 26 — good enough to edit, never pixel-exact.
  */
-export type DecomposeResult = { scene: Scene; source: string; tailNodes: string[] }
+export type DecomposeResult = { scene: Scene; source: string; tailNodes: string[]; warnings: string[] }
 
 /** Every decompose branch of a board starts from the same flat raster. */
 export const SOURCE_NODE = 'n:source'
@@ -356,6 +356,20 @@ export async function runDecompose(
   const elements = elementLayers.filter((l): l is ImageLayer => Boolean(l))
   const layers: Layer[] = [background, ...elements, ...recovered.texts.map((t) => t.layer)]
 
+  // Say out loud what a degraded run produced, so a doubled poster reads as a
+  // recorded consequence of the settings rather than as a mystery.
+  const warnings: string[] = []
+  const reset = recovered.texts.filter((t) => t.layer.type === 'text').length
+  if (!erased && reset) {
+    warnings.push(`背景未重建，${reset} 段重排文字会与原图上的文字重影`)
+  }
+  if (!erased && opts.inpaintBackground) {
+    warnings.push('重建被拒，背景沿用原图')
+  }
+  if (!masked.length && analysis.elements.length) {
+    warnings.push(`${analysis.elements.length} 个元素没有掩码，留在背景里，没有可编辑元素层`)
+  }
+
   return {
     scene: {
       canvas: { width, height, background: hexOr(analysis.background.dominantColor, '#111114') },
@@ -363,5 +377,6 @@ export async function runDecompose(
     },
     source: flat,
     tailNodes: [plateNode, ...(masked.length ? [cutsNode] : []), textNode],
+    warnings,
   }
 }
