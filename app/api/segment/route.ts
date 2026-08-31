@@ -9,7 +9,11 @@ export const maxDuration = 60
 
 // Leave headroom under maxDuration so a slow mask degrades into a clean JSON
 // answer the client can fall back from, instead of a platform-level 504.
-const TIMEOUT_MS = 45_000
+//
+// Measured: at 45s nearly every request timed out, but one did come back with a
+// usable mask — the capability is there, it is just slow to stream a base64 PNG.
+// Pushed as close to the 60s function ceiling as leaves room to answer.
+const TIMEOUT_MS = 52_000
 
 type RawMask = { label?: string; box_2d?: number[]; mask?: string }
 

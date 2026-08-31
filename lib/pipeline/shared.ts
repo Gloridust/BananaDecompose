@@ -37,20 +37,38 @@ export function checkCancelled(ctx: PipelineCtx) {
 
 /** Every model call goes through the global scheduler, so total in-flight
  *  requests stay bounded no matter how many branches are running at once. */
-export async function api<T>(path: string, ctx: PipelineCtx, body: unknown): Promise<T> {
+/** Worth another go: the connection died or the gateway gave up, neither of
+ *  which says anything about the request itself. Observed under a seven-branch
+ *  sweep as `Failed to fetch` and `HTTP 504`. */
+function isTransient(message: string) {
+  return /Failed to fetch|NetworkError|load failed|HTTP 50[234]|timed out|ECONNRESET/i.test(message)
+}
+
+export async function api<T>(path: string, ctx: PipelineCtx, body: unknown, attempt = 0): Promise<T> {
   checkCancelled(ctx)
-  return schedule(async () => {
-    checkCancelled(ctx)
-    const res = await fetch(path, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: ctx.signal,
+  try {
+    return await schedule(async () => {
+      checkCancelled(ctx)
+      const res = await fetch(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ctx.signal,
+      })
+      const json = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
+      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+      return json as T
     })
-    const json = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
-    if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-    return json as T
-  })
+  } catch (err) {
+    const message = (err as Error).message
+    if (attempt >= 1 || err instanceof Cancelled || (err as Error).name === 'AbortError' || !isTransient(message)) {
+      throw err
+    }
+    // Back off enough to let a queue drain before adding to it again.
+    await new Promise((r) => setTimeout(r, 2500))
+    checkCancelled(ctx)
+    return api<T>(path, ctx, body, attempt + 1)
+  }
 }
 
 /** Describes the board node a unit of work produces. */

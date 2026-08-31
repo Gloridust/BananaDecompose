@@ -1,6 +1,7 @@
 'use client'
 
-import { compositeMasked, imageSize, maskMatte } from '../matte'
+import { imageSize, maskMatte } from '../matte'
+import { erasePatches } from './erase'
 import { flatPrompt } from '../prompts'
 import { describeRuns, recoverText } from './text'
 import type { DecomposeOptions, ImageLayer, Layer, Scene, SceneAnalysis, UsageInfo } from '../types'
@@ -218,58 +219,84 @@ export async function runDecompose(
   const plateNode = `n:${B}:erase`
   const elementRegions = masked.map((el) => boxToRect(masks[el.id]!.box ?? el.box, width, height))
 
-  let erased: string | null = null
+  let plate = flat
+  let textFree = flat
+  let eraseNote = ''
+
   if (textRegions.length || elementRegions.length) {
-    erased = await tryTrack(
+    // Text first, and separately: elements are then cut from a raster that no
+    // longer carries baked type, so lifting one cannot drag the old lettering
+    // onto the clean plate.
+    const textPass = await tryTrack(
       ctx,
-      'inpaint',
-      '擦除文字与元素，重建背景',
+      'erase-text',
+      `清除文字区 ×${textRegions.length}`,
       async () => {
-        const json = await api<any>('/api/erase', ctx, {
-          image: flat,
-          targets: masked.map((e) => e.label),
+        const res = await erasePatches(ctx, flat, textRegions, { width, height }, {
+          model: models.image,
           aspectRatio: opts.aspectRatio,
           resolution: opts.resolution,
-          model: models.image,
         })
-        ctx.onArtifact({ label: '重绘底片', src: json.image, role: 'plate' })
+        if (res.plate) ctx.onArtifact({ label: '去文字底片', src: res.plate, role: 'plate' })
         return {
-          value: json.image as string,
-          usage: json.usage as UsageInfo,
-          images: [{ label: '重绘底片', src: json.image }],
+          value: res,
+          usage: { cost: res.cost },
+          detail: res.note,
+          images: res.plate ? [{ label: '去文字底片', src: res.plate }] : undefined,
         }
       },
-      { id: plateNode, kind: 'erase', inputs: [N.source, textNode] },
-      { value: null as unknown as string, note: '重建被拒，背景沿用原图（文字会重影）' },
+      { id: `n:${B}:erase-text`, kind: 'erase', inputs: [N.source, textNode] },
+      { value: { plate: null, cost: 0, patches: [], note: '文字清除被拒' }, note: '文字清除被拒，背景仍带原文字' },
     )
+    if (textPass.plate) textFree = textPass.plate
+    eraseNote = textPass.note
+
+    plate = textFree
+    if (elementRegions.length) {
+      const elementPass = await tryTrack(
+        ctx,
+        'erase-elements',
+        `清除元素区 ×${elementRegions.length}`,
+        async () => {
+          const res = await erasePatches(ctx, textFree, elementRegions, { width, height }, {
+            model: models.image,
+            aspectRatio: opts.aspectRatio,
+            resolution: opts.resolution,
+            targets: masked.map((e) => e.label),
+          })
+          if (res.plate) ctx.onArtifact({ label: '最终背景板', src: res.plate, role: 'plate' })
+          return {
+            value: res,
+            usage: { cost: res.cost },
+            detail: res.note,
+            images: res.plate ? [{ label: '最终背景板', src: res.plate }] : undefined,
+          }
+        },
+        { id: plateNode, kind: 'erase', inputs: [`n:${B}:erase-text`], images: undefined } as any,
+        { value: { plate: null, cost: 0, patches: [], note: '元素清除被拒' }, note: '元素清除被拒，背景仍带原元素' },
+      )
+      if (elementPass.plate) plate = elementPass.plate
+      eraseNote += ` · ${elementPass.note}`
+    } else {
+      emit(ctx, {
+        id: plateNode,
+        kind: 'erase',
+        label: '最终背景板',
+        detail: '没有元素被抬走，背景板即去文字底片',
+        inputs: [`n:${B}:erase-text`],
+        status: 'ok',
+        images: [{ label: '最终背景板', src: plate }],
+      })
+    }
   } else {
-    skip(
-      ctx,
-      'inpaint',
-      '背景重建',
-      '没有要抬走的东西，背景沿用原图',
-      { id: plateNode, kind: 'erase', inputs: [N.source, textNode] },
-    )
-  }
-
-  // Text goes first: elements are then cut from an image that no longer carries
-  // baked type, so a lifted element cannot drag the old lettering back on top of
-  // the clean plate — which is exactly how the ghosting used to appear.
-  const textFree = erased ? await compositeMasked(flat, erased, textRegions) : flat
-  const plate = erased ? await compositeMasked(textFree, erased, elementRegions) : flat
-
-  if (erased) {
-    emit(ctx, {
+    skip(ctx, 'erase-text', '背景清除', '没有要抬走的东西，背景沿用原图', {
       id: plateNode,
       kind: 'erase',
-      label: '擦除文字与元素，重建背景',
-      detail: `只在 ${textRegions.length} 处文字 + ${elementRegions.length} 处元素合成，其余像素与原图一致`,
       inputs: [N.source, textNode],
-      status: 'ok',
-      images: [{ label: '最终背景板', src: plate }],
     })
-    ctx.onArtifact({ label: '最终背景板', src: plate, role: 'plate' })
   }
+
+  const erased = plate !== flat || textFree !== flat
 
   // 6 ── lift each masked element out of the text-free raster
   const cutsNode = `n:${B}:cuts`

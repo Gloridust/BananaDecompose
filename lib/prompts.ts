@@ -338,8 +338,33 @@ bare, uninterrupted, and complete. Extend the existing textures, gradients, patt
 lighting continuously across the whole frame so the surface reads as one unbroken material.
 
 No residue of anything that used to sit on the surface: no ghosting, no blur patches, no smudges,
-no faint outlines, no partial fragments.
+no faint outlines, no partial fragments. Fading something down until it blends in is not removal —
+the surface must be genuinely empty, as if nothing was ever placed there.
 
 Everything else is unchanged: identical framing, identical composition, identical palette,
-identical dimensions.`
+identical dimensions. Match the exact shade and brightness of the surrounding surface.`
+}
+
+/**
+ * Clear one small patch rather than the whole frame.
+ *
+ * Handing the model the entire poster and asking it to remove the type gives it
+ * enough latitude to re-tone everything — observed: a header band came back
+ * several shades darker and the title merely faded rather than gone. A crop that
+ * is mostly surface already leaves far less room for interpretation, and the
+ * patch is composited back so nothing outside it can drift at all.
+ */
+export function erasePatchPrompt() {
+  return `Return this exact crop with the surface empty.
+
+Whatever is sitting on top of the surface — lettering, characters, marks, objects — is gone, and
+the material underneath continues through where it used to be: same colour, same brightness, same
+texture, same grain, same weave, same gradient direction, same wear.
+
+Fading something until it blends in does not count. Nothing may remain of it, not a faint outline,
+not a soft patch, not a change in tone where it used to be.
+
+Do not adjust the overall colour, brightness or contrast of the crop — it is being placed straight
+back into a larger picture and must match its surroundings exactly. Keep the identical framing and
+dimensions. Add nothing.`
 }

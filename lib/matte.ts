@@ -8,8 +8,17 @@ export function loadImage(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image()
     img.crossOrigin = 'anonymous'
-    img.onload = () => resolve(img)
-    img.onerror = () => reject(new Error('Failed to decode image'))
+    img.onload = () => {
+      // A zero-sized decode succeeds but is unusable, and every downstream
+      // measurement would quietly divide by it.
+      if (!img.naturalWidth || !img.naturalHeight) {
+        reject(new Error(`图片解码出来是 0×0（长度 ${src.length}，开头 ${src.slice(0, 32)}）`))
+        return
+      }
+      resolve(img)
+    }
+    img.onerror = () =>
+      reject(new Error(`图片解码失败（长度 ${src.length}，开头 ${src.slice(0, 32)}）`))
     img.src = src
   })
 }
@@ -430,6 +439,66 @@ export async function featherEdges(src: string, px = 12): Promise<string> {
   }
 
   ctx.putImageData(data, 0, 0)
+  return canvas.toDataURL('image/png')
+}
+
+export type Rect = { x: number; y: number; w: number; h: number }
+
+/**
+ * Merge boxes that sit close enough to be reconstructed together.
+ *
+ * Erasing runs one at a time costs a call each; erasing the whole frame at once
+ * gives the model so much latitude that it re-tones the entire picture. Clusters
+ * are the middle: a title and its subtitle on one band become one patch, the
+ * paragraph below becomes another.
+ */
+export function clusterRects(rects: Rect[], gap = 24): Rect[] {
+  const boxes = rects.map((r) => ({ ...r }))
+  let merged = true
+
+  while (merged) {
+    merged = false
+    outer: for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const a = boxes[i]
+        const b = boxes[j]
+        const overlaps =
+          a.x - gap < b.x + b.w && b.x - gap < a.x + a.w && a.y - gap < b.y + b.h && b.y - gap < a.y + a.h
+        if (!overlaps) continue
+        const x = Math.min(a.x, b.x)
+        const y = Math.min(a.y, b.y)
+        boxes[i] = { x, y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y }
+        boxes.splice(j, 1)
+        merged = true
+        break outer
+      }
+    }
+  }
+  return boxes
+}
+
+/** Crop a rectangle out of an image, with a margin of context around it. */
+export async function cropRect(src: string, rect: Rect, pad: number) {
+  const img = await loadImage(src)
+  const px = Math.max(8, rect.w * pad)
+  const py = Math.max(8, rect.h * pad)
+  const sx = Math.max(0, Math.round(rect.x - px))
+  const sy = Math.max(0, Math.round(rect.y - py))
+  const sw = Math.min(img.naturalWidth - sx, Math.round(rect.w + px * 2))
+  const sh = Math.min(img.naturalHeight - sy, Math.round(rect.h + py * 2))
+
+  const { canvas, ctx } = ctxOf(sw, sh)
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh)
+  return { src: canvas.toDataURL('image/png'), rect: { x: sx, y: sy, w: sw, h: sh } }
+}
+
+/** Paste a patch back at a known rectangle, feathered so the seam disappears. */
+export async function pastePatch(baseSrc: string, patchSrc: string, rect: Rect, feather = 10): Promise<string> {
+  const base = await loadImage(baseSrc)
+  const patch = await loadImage(await featherEdges(patchSrc, feather))
+  const { canvas, ctx } = ctxOf(base.naturalWidth, base.naturalHeight)
+  ctx.drawImage(base, 0, 0)
+  ctx.drawImage(patch, rect.x, rect.y, rect.w, rect.h)
   return canvas.toDataURL('image/png')
 }
 
