@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
-import { extractInk, fitText, scoreFonts, scoreMargin, FONT_CANDIDATES } from '@/lib/glyph'
+import { ensureFonts, extractInk, fitText, scoreFonts, scoreMargin, FONT_CANDIDATES } from '@/lib/glyph'
 import { fontStack } from '@/lib/export'
 
 // Ground truth we control exactly: render type at a known size, colour and
@@ -97,8 +97,11 @@ export default function GlyphTest() {
 
   const run = useCallback(async () => {
     setBusy(true)
-    // Web fonts must be resolved before anything is measured or rendered.
-    await document.fonts.ready
+    // Web fonts must be genuinely fetched, not merely 'ready' — see ensureFonts.
+    await ensureFonts(
+      [...FONT_CANDIDATES, ...TRUTHS.map((t) => ({ family: t.family, weight: t.weight }))],
+      TRUTHS.map((t) => t.text).join(''),
+    )
     const out: Case[] = []
 
     for (const truth of TRUTHS) {

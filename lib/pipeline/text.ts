@@ -1,7 +1,7 @@
 'use client'
 
 import { cropAndZoom } from '../matte'
-import { FONT_CANDIDATES, dedupeRuns, extractInk, fitText, scoreFonts, scoreMargin, type InkMetrics } from '../glyph'
+import { FONT_CANDIDATES, dedupeRuns, ensureFonts, extractInk, fitText, scoreFonts, scoreMargin, type InkMetrics } from '../glyph'
 import { boxToRect, hexOr, mapLimit, type PipelineCtx } from './shared'
 import { api } from './shared'
 import type { ImageLayer, Layer, SceneAnalysis, TextLayer, TextMode, UsageInfo } from '../types'
@@ -33,6 +33,10 @@ export async function recoverText(
 ): Promise<{ texts: RecoveredText[]; cost: number; notes: string[] }> {
   // A layout pass readily reports the same glyphs twice — "V60杯" and "V60" over
   // one label — and rendering both stacks two layers on one spot.
+  // Every measurement below depends on the real faces being resolved; on a cold
+  // page they are not, and the fallback's metrics would be measured instead.
+  await ensureFonts(FONT_CANDIDATES, runs.map((r) => r.content).join(''))
+
   const deduped = dedupeRuns(runs)
   const dropped = runs.length - deduped.length
   const notes: string[] = []

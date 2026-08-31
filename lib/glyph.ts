@@ -64,6 +64,36 @@ function otsu(hist: number[], total: number) {
   return threshold
 }
 
+/**
+ * Force the web fonts to be present before anything is measured.
+ *
+ * `document.fonts.ready` only settles requests already in flight, and a Google
+ * Fonts face is not fetched until something actually renders a glyph it covers.
+ * Measuring before that silently returns the fallback's metrics — which makes
+ * every candidate look identical and every fitted size wrong, with no error.
+ */
+const fontsLoaded = new Set<string>()
+
+export async function ensureFonts(
+  families: { family: string; weight: number }[],
+  sample: string,
+): Promise<void> {
+  if (typeof document === 'undefined' || !document.fonts) return
+
+  const pending: Promise<unknown>[] = []
+  for (const f of families) {
+    const key = `${f.weight} ${f.family}`
+    if (fontsLoaded.has(key)) continue
+    fontsLoaded.add(key)
+    // The sample text matters: a CJK face ships as many subsets, and only the
+    // ones covering these characters get fetched.
+    pending.push(document.fonts.load(`${f.weight} 100px "${f.family}"`, sample).catch(() => undefined))
+  }
+
+  if (pending.length) await Promise.all(pending)
+  await document.fonts.ready
+}
+
 function median(values: number[]) {
   if (!values.length) return 0
   const sorted = [...values].sort((a, b) => a - b)
@@ -344,6 +374,9 @@ export async function scoreFonts(
   ink: InkMetrics,
   italic: boolean,
 ): Promise<FontScore[]> {
+  // Without this every candidate renders in the same fallback and the scoreboard
+  // is noise — which reads as "cannot tell them apart" rather than as a failure.
+  await ensureFonts(candidates, text)
   const target = ink.box
   const scores: FontScore[] = []
 
