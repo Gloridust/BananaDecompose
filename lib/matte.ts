@@ -327,6 +327,38 @@ export async function compositeMasked(
   return out.canvas.toDataURL('image/png')
 }
 
+/**
+ * Ramp the alpha down at the border.
+ *
+ * A regenerated patch is opaque to its own edge, and dropping that straight onto
+ * a composition leaves a visible rectangle even when the content matches. Fading
+ * the last few pixels lets the patch dissolve into what it is covering.
+ */
+export async function featherEdges(src: string, px = 12): Promise<string> {
+  const img = await loadImage(src)
+  const w = img.naturalWidth
+  const h = img.naturalHeight
+  const band = Math.max(2, Math.min(px, Math.floor(Math.min(w, h) / 4)))
+
+  const { canvas, ctx } = ctxOf(w, h)
+  ctx.drawImage(img, 0, 0)
+  const data = ctx.getImageData(0, 0, w, h)
+  const D = data.data
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const edge = Math.min(x, y, w - 1 - x, h - 1 - y)
+      if (edge >= band) continue
+      const a = edge / band
+      const i = (y * w + x) * 4
+      D[i + 3] = Math.round(D[i + 3] * a * a * (3 - 2 * a)) // smoothstep
+    }
+  }
+
+  ctx.putImageData(data, 0, 0)
+  return canvas.toDataURL('image/png')
+}
+
 /** Crop a region and scale it up, so a vision model sees the glyphs large. */
 export async function cropAndZoom(
   src: string,

@@ -107,6 +107,14 @@ localStorage 存索引，IndexedDB 存节点数据。
 
 ---
 
+## 圈选重绘落成图层，不拍进底板
+
+**为什么**：在分层文件里，一个关不掉也移不动的编辑不叫编辑，叫提交。补丁作为独立图层叠上去，就能隐藏、移动、删除、调层序 —— 跟其他图层一视同仁。
+
+裁片外扩 18% 带上周边，是因为模型看不到邻域就接不上光照和风格，回来的东西像贴纸。边缘 smoothstep 羽化，是因为重画结果不透明到边，直接贴会留一个可见矩形。
+
+---
+
 ## 没做的事
 
 | | 为什么不做 |
@@ -114,5 +122,5 @@ localStorage 存索引，IndexedDB 存节点数据。
 | **本地 GPU 分层模型** | [Qwen-Image-Layered](https://github.com/QwenLM/Qwen-Image-Layered)（Apache 2.0）是目前最强的开源拆解方案，但 1024px 约 120s、峰值 45GB 显存。这是纯 API 项目 |
 | **专用 OCR** | Cloud Vision 的 `DOCUMENT_TEXT_DETECTION` 返回逐字符 vertices，定位精度上限高一个档次，但破了"纯 Gemini"的定位 |
 | **真正的字体识别** | Adobe 背后是 3 万+ Adobe Fonts 的检索。渲染回测是弱识别器，所以它会在分差不足时认怂 |
-| **局部重绘（inpainting mask）** | `erase` 目前是整图重绘 + 按区域合成。生产环境应该配掩码做真正的局部重绘 |
+| **带掩码的真局部重绘** | `erase` 和圈选重绘都是"整帧重画 + 按区域合成"，不是把掩码交给模型让它只动掩码内。生产环境应该用支持 inpainting mask 的接口 |
 | **深度估计** | z-order 靠模型推断，没有 Depth Anything 一类的兜底 |

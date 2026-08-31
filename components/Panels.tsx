@@ -115,10 +115,12 @@ export function Inspector({
   layer,
   onChange,
   onRetype,
+  onEditLayer,
 }: {
   layer: Layer | null
   onChange: (patch: Partial<Layer>) => void
   onRetype?: (layer: ImageLayer, text: string) => Promise<void>
+  onEditLayer?: (layer: ImageLayer, instruction: string) => Promise<void>
 }) {
   if (!layer) {
     return <p className="px-1 py-2 text-xs text-ink-400">选中一个图层查看属性。双击文字图层可直接在画布上改字。</p>
@@ -146,6 +148,56 @@ export function Inspector({
 
       {layer.type === 'text' ? <TextControls layer={layer} onChange={onChange} /> : null}
       {layer.type === 'image' && layer.retype && onRetype ? <RetypeControls layer={layer} onRetype={onRetype} /> : null}
+      {layer.type === 'image' && !layer.retype && onEditLayer && layer.id !== 'background' ? (
+        <EditLayerControls layer={layer} onEdit={onEditLayer} />
+      ) : null}
+    </div>
+  )
+}
+
+/** Rewrite one layer in place, using its own pixels as the reference. Same trip
+ *  as the marquee edit, scoped to a layer that already has clean boundaries. */
+function EditLayerControls({
+  layer,
+  onEdit,
+}: {
+  layer: ImageLayer
+  onEdit: (layer: ImageLayer, instruction: string) => Promise<void>
+}) {
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  return (
+    <div className="space-y-2 border-t border-ink-800 pt-3">
+      <p className="text-[10px] leading-snug text-ink-400">
+        用 AI 改这个图层：把它自己的像素当参考重画，位置和尺寸不变。
+      </p>
+      <input
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        placeholder="例如：换成玻璃材质"
+        className="w-full rounded border border-ink-700 bg-ink-900 px-2 py-1.5 text-xs outline-none focus:border-banana-500"
+      />
+      <button
+        disabled={!draft.trim() || busy}
+        onClick={async () => {
+          setBusy(true)
+          setError(null)
+          try {
+            await onEdit(layer, draft.trim())
+            setDraft('')
+          } catch (err) {
+            setError((err as Error).message)
+          } finally {
+            setBusy(false)
+          }
+        }}
+        className="w-full rounded border border-ink-700 px-2 py-1.5 text-[11px] text-ink-200 transition hover:border-banana-500 hover:text-banana-400 disabled:opacity-40"
+      >
+        {busy ? '重画中…' : '重画这个图层'}
+      </button>
+      {error ? <p className="text-[10px] leading-snug text-rose-400">{error}</p> : null}
     </div>
   )
 }

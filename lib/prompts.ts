@@ -275,6 +275,27 @@ export const REFINE_SCHEMA = {
   },
 } as const
 
+// --------------------------------------------------------- region edit
+
+/**
+ * Redraw one region of a composition in place.
+ *
+ * The reference is the region itself with a margin of its surroundings, so the
+ * model can match the lighting, palette and rendering style of what it is being
+ * dropped back into — an edit that ignores its neighbourhood reads as a sticker.
+ */
+export function editRegionPrompt(instruction: string) {
+  return `Apply this change to the image: ${instruction}
+
+Keep the exact same framing, camera angle, scale and composition as the reference.
+Everything the instruction does not mention stays as it is — same lighting direction, same
+colour palette, same rendering style, same level of detail, same texture and grain.
+The edges of the frame must continue to match their surroundings seamlessly, because this
+crop is going straight back into the picture it came from.
+
+Return the full frame, edge to edge. Do not add borders, captions, labels or annotations.`
+}
+
 // ------------------------------------------------------------- retype
 
 /**

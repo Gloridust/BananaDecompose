@@ -12,23 +12,31 @@ type Drag =
 type Corner = 'nw' | 'ne' | 'sw' | 'se'
 const CORNERS: Corner[] = ['nw', 'ne', 'sw', 'se']
 
+export type Region = { x: number; y: number; w: number; h: number }
+
 export default function Stage({
   scene,
   selectedId,
   onSelect,
   onChange,
   showOutlines,
+  marquee,
+  onMarquee,
 }: {
   scene: Scene
   selectedId: string | null
   onSelect: (id: string | null) => void
   onChange: (id: string, patch: Partial<Layer>) => void
   showOutlines: boolean
+  /** When on, dragging draws a selection rectangle instead of moving layers. */
+  marquee?: boolean
+  onMarquee?: (region: Region) => void
 }) {
   const hostRef = useRef<HTMLDivElement>(null)
   const [scale, setScale] = useState(1)
   const [drag, setDrag] = useState<Drag>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [box, setBox] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null)
 
   useLayoutEffect(() => {
     const host = hostRef.current
@@ -101,9 +109,41 @@ export default function Stage({
   return (
     <div
       ref={hostRef}
-      className="checker relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg border border-ink-800"
+      className={`checker relative flex h-full w-full items-center justify-center overflow-hidden rounded-lg border ${
+        marquee ? 'cursor-crosshair border-banana-500/60' : 'border-ink-800'
+      }`}
       onPointerDown={(e) => {
-        if (e.target === e.currentTarget) onSelect(null)
+        if (!marquee) {
+          if (e.target === e.currentTarget) onSelect(null)
+          return
+        }
+        // Marquee coordinates live in scene space, so they survive pan and zoom.
+        const rect = e.currentTarget.getBoundingClientRect()
+        const originX = rect.left + (rect.width - scene.canvas.width * scale) / 2
+        const originY = rect.top + (rect.height - scene.canvas.height * scale) / 2
+        const p = { x: (e.clientX - originX) / scale, y: (e.clientY - originY) / scale }
+        setBox({ x0: p.x, y0: p.y, x1: p.x, y1: p.y })
+
+        const move = (ev: PointerEvent) =>
+          setBox((b) => (b ? { ...b, x1: (ev.clientX - originX) / scale, y1: (ev.clientY - originY) / scale } : b))
+        const up = () => {
+          window.removeEventListener('pointermove', move)
+          window.removeEventListener('pointerup', up)
+          setBox((b) => {
+            if (b) {
+              const region = {
+                x: Math.max(0, Math.min(b.x0, b.x1)),
+                y: Math.max(0, Math.min(b.y0, b.y1)),
+                w: Math.abs(b.x1 - b.x0),
+                h: Math.abs(b.y1 - b.y0),
+              }
+              if (region.w > 12 && region.h > 12) onMarquee?.(region)
+            }
+            return null
+          })
+        }
+        window.addEventListener('pointermove', move)
+        window.addEventListener('pointerup', up)
       }}
     >
       <div
@@ -116,6 +156,19 @@ export default function Stage({
           background: scene.canvas.background,
         }}
       >
+        {box ? (
+          <div
+            className="pointer-events-none absolute border-2 border-dashed border-banana-400 bg-banana-400/10"
+            style={{
+              left: Math.min(box.x0, box.x1),
+              top: Math.min(box.y0, box.y1),
+              width: Math.abs(box.x1 - box.x0),
+              height: Math.abs(box.y1 - box.y0),
+              zIndex: 9999,
+            }}
+          />
+        ) : null}
+
         {scene.layers.map((layer, index) => {
           if (!layer.visible) return null
           const selected = layer.id === selectedId
@@ -137,7 +190,7 @@ export default function Stage({
           }
 
           const start = (e: React.PointerEvent) => {
-            if (layer.locked) return
+            if (marquee || layer.locked) return
             e.stopPropagation()
             onSelect(layer.id)
             if (editingId === layer.id) return
@@ -189,7 +242,7 @@ export default function Stage({
                 </div>
               )}
 
-              {selected && !layer.locked
+              {selected && !layer.locked && !marquee
                 ? CORNERS.map((corner) => (
                     <span
                       key={corner}
