@@ -5,11 +5,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Controls, { DEFAULT_SETTINGS, type Settings } from './Controls'
 import BoardCanvas from './Board'
 import BranchLegend from './BranchLegend'
+import BoardBar from './BoardBar'
 import SceneEditor from './SceneEditor'
 import BenchmarkPanel from './BenchmarkPanel'
 import { ArtifactStrip, StepLog } from './Panels'
-import { PLAN_NODE, PLATE_NODE, PROMPT_NODE, aspectToSize, preparePlan, preparePlate, runCompose } from '@/lib/pipeline/compose'
-import { SOURCE_NODE, prepareSource, runDecompose } from '@/lib/pipeline/decompose'
+import { aspectToSize, preparePlan, preparePlate, runCompose, sharedNodes } from '@/lib/pipeline/compose'
+import { prepareSource, runDecompose } from '@/lib/pipeline/decompose'
 import { getBoard, listBoards, loadSettings, newId, saveBoard, saveSettings } from '@/lib/history'
 import { computeMetrics } from '@/lib/metrics'
 import { fileToDataUrl, thumbnail } from '@/lib/matte'
@@ -22,6 +23,7 @@ import type {
   Artifact,
   Board,
   BoardBranch,
+  BoardMeta,
   BoardNode,
   ComposeOptions,
   DecomposeOptions,
@@ -41,10 +43,14 @@ type BranchPlan = {
   decompose: DecomposeOptions
 }
 
+/** A canvas is a document: it can be started fresh, reopened, or added to. */
+type RunMode = 'new' | 'append'
+
 export default function Workbench() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS)
   const [hydrated, setHydrated] = useState(false)
   const [board, setBoard] = useState<Board | null>(null)
+  const [boards, setBoards] = useState<BoardMeta[]>([])
   const [steps, setSteps] = useState<RunStep[]>([])
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [running, setRunning] = useState(false)
@@ -72,8 +78,10 @@ export default function Workbench() {
     setSettings(loadSettings(DEFAULT_SETTINGS))
     setHydrated(true)
 
+    const list = listBoards()
+    setBoards(list)
     const boardId = new URLSearchParams(window.location.search).get('board')
-    const target = boardId ?? listBoards()[0]?.id
+    const target = boardId ?? list[0]?.id
     if (target) {
       getBoard(target).then((prev) => {
         if (!prev) return
@@ -166,6 +174,7 @@ export default function Workbench() {
     async (
       plan: BranchPlan,
       shared: { plan?: ScenePlan; background?: string; source?: string; prepared?: boolean },
+      runKey: string,
       signal: AbortSignal,
     ) => {
       if (!models) return
@@ -176,6 +185,7 @@ export default function Workbench() {
       const ctx: PipelineCtx = {
         signal,
         branchId: plan.id,
+        runKey,
         totals: branchTotals,
         onStep: (step) => pushStep(plan.label, plan.id, step),
         onArtifact: (a) => {
@@ -273,7 +283,7 @@ export default function Workbench() {
   // ------------------------------------------------- run a whole board
 
   const runBoard = useCallback(
-    async (plans: BranchPlan[]) => {
+    async (plans: BranchPlan[], mode: RunMode) => {
       if (!models || !plans.length) return
       const controller = new AbortController()
       abortRef.current = controller
@@ -284,51 +294,84 @@ export default function Workbench() {
       artifactsRef.current = []
       setSteps([])
       setArtifacts([])
-      setHiddenBranches(new Set())
-      setHiddenNodes(new Set())
       setSelectedNodeId(null)
 
-      const composeArms = plans.filter((p) => p.pipeline === 'compose')
-      const decomposeArms = plans.filter((p) => p.pipeline === 'decompose')
-      // Only text-free plates are shareable; the baked arm renders its own copy in.
-      const plateArms = composeArms.filter((p) => p.compose.text === 'live')
+      const existing = mode === 'append' ? boardRef.current : null
+      // Each round gets its own key so a canvas can hold several: shared upstream
+      // merges within a round, never across them, and two runs of the same arm
+      // stay distinct branches.
+      const round = existing ? existing.rounds + 1 : 1
+      const runKey = `r${round}`
+      const scoped = plans.map((p) => ({ ...p, id: `${runKey}:${p.id}`, label: existing ? `${p.label} ·${round}` : p.label }))
+      const N = sharedNodes(runKey)
+
+      if (mode === 'new') {
+        setHiddenBranches(new Set())
+        setHiddenNodes(new Set())
+      }
 
       const boardStart = performance.now()
-      const fresh: Board = {
-        id: newId(),
-        createdAt: Date.now(),
-        prompt: settings.prompt,
-        branchCount: plans.length,
-        nodeCount: 0,
-        totalMs: 0,
-        serialMs: 0,
-        prepMs: 0,
-        totalCost: 0,
-        concurrency: settings.concurrency,
-        models,
-        fromUpload: Boolean(sourceImage),
-        branches: plans.map((p) => ({
-          id: p.id,
-          label: p.label,
-          pipeline: p.pipeline,
-          options: p.pipeline === 'compose' ? p.compose : p.decompose,
-          status: 'skipped',
-          cost: 0,
-          ms: 0,
-        })),
-        nodes: [
-          {
-            id: PROMPT_NODE,
-            kind: 'prompt',
-            label: '提示词',
-            branches: [],
-            inputs: [],
-            status: 'ok',
-            summary: settings.prompt,
-          },
-        ],
+      const promptNode: BoardNode = {
+        id: N.prompt,
+        kind: 'prompt',
+        label: existing ? `提示词 ·${round}` : '提示词',
+        branches: [],
+        inputs: [],
+        status: 'ok',
+        summary: settings.prompt,
       }
-      commit(fresh)
+
+      const base: Board = existing
+        ? {
+            ...existing,
+            rounds: round,
+            prompt: settings.prompt,
+            branchCount: existing.branches.length + scoped.length,
+            branches: [
+              ...existing.branches,
+              ...scoped.map((p) => ({
+                id: p.id,
+                label: p.label,
+                pipeline: p.pipeline,
+                options: p.pipeline === 'compose' ? p.compose : p.decompose,
+                status: 'skipped' as const,
+                cost: 0,
+                ms: 0,
+              })),
+            ],
+            nodes: [...existing.nodes, promptNode],
+          }
+        : {
+            id: newId(),
+            createdAt: Date.now(),
+            prompt: settings.prompt,
+            rounds: 1,
+            branchCount: scoped.length,
+            nodeCount: 0,
+            totalMs: 0,
+            serialMs: 0,
+            prepMs: 0,
+            totalCost: 0,
+            concurrency: settings.concurrency,
+            models,
+            fromUpload: Boolean(sourceImage),
+            branches: scoped.map((p) => ({
+              id: p.id,
+              label: p.label,
+              pipeline: p.pipeline,
+              options: p.pipeline === 'compose' ? p.compose : p.decompose,
+              status: 'skipped' as const,
+              cost: 0,
+              ms: 0,
+            })),
+            nodes: [promptNode],
+          }
+      commit(base)
+
+      const composeArms = scoped.filter((p) => p.pipeline === 'compose')
+      const decomposeArms = scoped.filter((p) => p.pipeline === 'decompose')
+      // Only text-free plates are shareable; the baked arm renders its own copy in.
+      const plateArms = composeArms.filter((p) => p.compose.text === 'live')
 
       const shared: { plan?: ScenePlan; background?: string; source?: string; prepared?: boolean } = {
         source: sourceImage ?? undefined,
@@ -339,10 +382,11 @@ export default function Workbench() {
       /** A context whose nodes are credited to every branch that will consume them. */
       const prepCtx = (attribution: string[]): PipelineCtx => ({
         signal: controller.signal,
-        branchId: 'shared',
+        branchId: `${runKey}-shared`,
+        runKey,
         attribution,
         totals: prepTotals,
-        onStep: (step) => pushStep('共享', 'shared', step),
+        onStep: (step) => pushStep('共享', `${runKey}-shared`, step),
         onArtifact: pushArtifact,
         onNode: (n) => upsertNode(attribution, n),
       })
@@ -350,7 +394,7 @@ export default function Workbench() {
       try {
         // ── phase 0: shared upstream, produced once. The two pipelines have no
         // dependency on each other, so their prep runs concurrently.
-        setProgress({ label: '共享上游：规划 / 背景板 / 来源图', index: 0, total: plans.length })
+        setProgress({ label: '共享上游：规划 / 背景板 / 来源图', index: 0, total: scoped.length })
         await Promise.all([
           (async () => {
             if (!composeArms.length) return
@@ -373,18 +417,16 @@ export default function Workbench() {
       }
 
       const prepMs = Math.round(performance.now() - boardStart)
-      const withPrep = boardRef.current
-      if (withPrep) commit({ ...withPrep, prepMs, totalCost: prepTotals.cost })
 
       // ── phase 1: every branch at once. The global scheduler bounds total load,
       // so branch count no longer multiplies into a request storm.
-      if (shared.plan || shared.source || !plans.some((p) => p.pipeline === 'compose')) {
+      if (shared.plan || shared.source || !composeArms.length) {
         let done = 0
         await Promise.all(
-          plans.map(async (p) => {
-            await runBranch(p, shared, controller.signal)
+          scoped.map(async (p) => {
+            await runBranch(p, shared, runKey, controller.signal)
             done++
-            setProgress({ label: p.label, index: done, total: plans.length })
+            setProgress({ label: p.label, index: done, total: scoped.length })
           }),
         )
       }
@@ -395,45 +437,84 @@ export default function Workbench() {
 
       const finishedBoard = boardRef.current
       if (finishedBoard) {
-        const sceneNode = finishedBoard.nodes.find((n) => n.kind === 'scene' && n.images?.length)
+        const sceneNode = [...finishedBoard.nodes].reverse().find((n) => n.kind === 'scene' && n.images?.length)
         const finished: Board = {
           ...finishedBoard,
-          thumbnail: sceneNode?.images?.[0]?.src,
+          thumbnail: sceneNode?.images?.[0]?.src ?? finishedBoard.thumbnail,
           nodeCount: finishedBoard.nodes.length,
-          prepMs,
-          totalMs: Math.round(performance.now() - boardStart),
+          prepMs: finishedBoard.prepMs + prepMs,
+          totalMs: (existing?.totalMs ?? 0) + Math.round(performance.now() - boardStart),
           serialMs: prepMs + finishedBoard.branches.reduce((a, b) => a + b.ms, 0),
           totalCost: prepTotals.cost + finishedBoard.branches.reduce((a, b) => a + b.cost, 0),
         }
         commit(finished)
         await saveBoard(finished).catch(() => undefined)
+        setBoards(listBoards())
       }
     },
     [models, settings.prompt, settings.concurrency, sourceImage, commit, runBranch, upsertNode, pushStep, pushArtifact],
   )
 
-  const runSingle = useCallback(() => {
-    const pipeline = settings.pipeline
-    return runBoard([
-      {
-        id: 'single',
-        label: pipeline === 'compose' ? `A · ${settings.compose.matte}` : `B · ${settings.decompose.useMasks ? '掩码' : 'bbox'}`,
-        pipeline,
-        compose: settings.compose,
-        decompose: settings.decompose,
-      },
-    ])
-  }, [runBoard, settings])
+  const runSingle = useCallback(
+    (mode: RunMode) => {
+      const pipeline = settings.pipeline
+      return runBoard(
+        [
+          {
+            id: 'single',
+            label:
+              pipeline === 'compose'
+                ? `A · ${settings.compose.matte}`
+                : `B · ${settings.decompose.textMode === 'pixel' ? '原始笔画' : '重排'}`,
+            pipeline,
+            compose: settings.compose,
+            decompose: settings.decompose,
+          },
+        ],
+        mode,
+      )
+    },
+    [runBoard, settings],
+  )
 
-  const runBenchmark = useCallback(() => {
-    const arms = VARIANTS.filter((v) => selection.includes(v.id))
-    return runBoard(
-      arms.map((arm) => {
-        const opts = resolveOptions(arm, { compose: settings.compose, decompose: settings.decompose })
-        return { id: arm.id, label: arm.label, pipeline: arm.pipeline, compose: opts.compose, decompose: opts.decompose }
-      }),
-    )
-  }, [runBoard, selection, settings])
+  const runBenchmark = useCallback(
+    (mode: RunMode) => {
+      const arms = VARIANTS.filter((v) => selection.includes(v.id))
+      return runBoard(
+        arms.map((arm) => {
+          const opts = resolveOptions(arm, { compose: settings.compose, decompose: settings.decompose })
+          return { id: arm.id, label: arm.label, pipeline: arm.pipeline, compose: opts.compose, decompose: opts.decompose }
+        }),
+        mode,
+      )
+    },
+    [runBoard, selection, settings],
+  )
+
+  const newBoard = useCallback(() => {
+    boardRef.current = null
+    setBoard(null)
+    setSteps([])
+    setArtifacts([])
+    setSelectedNodeId(null)
+    setHiddenBranches(new Set())
+    setHiddenNodes(new Set())
+    stepsRef.current = []
+    artifactsRef.current = []
+    if (window.location.search) window.history.replaceState(null, '', window.location.pathname)
+  }, [])
+
+  const openBoard = useCallback(async (id: string) => {
+    const found = await getBoard(id)
+    if (!found) return
+    boardRef.current = found
+    setBoard(found)
+    setSelectedNodeId(null)
+    setHiddenBranches(new Set())
+    setHiddenNodes(new Set())
+    setSettings((cur) => ({ ...cur, prompt: found.prompt }))
+    window.history.replaceState(null, '', `${window.location.pathname}?board=${id}`)
+  }, [])
 
   const cancel = useCallback(() => abortRef.current?.abort(), [])
 
@@ -493,7 +574,13 @@ export default function Workbench() {
         <h1 className="font-mono text-sm font-semibold tracking-tight">
           <span className="text-banana-400">Banana</span>Decompose
         </h1>
-        <p className="hidden text-[11px] text-ink-400 md:block">节点画布 · 每条分支的每个中间产物</p>
+        <BoardBar
+          board={board}
+          boards={boards}
+          running={running}
+          onNew={newBoard}
+          onOpen={openBoard}
+        />
         <div className="flex-1" />
         {hiddenNodes.size ? (
           <button onClick={() => setHiddenNodes(new Set())} className="font-mono text-[10px] text-ink-400 hover:text-banana-400">
@@ -519,14 +606,39 @@ export default function Workbench() {
       ) : null}
       {error ? <div className="shrink-0 border-b border-rose-500/40 bg-rose-500/10 px-4 py-2 text-xs text-rose-200">{error}</div> : null}
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[320px_1fr]">
-        <aside className="scrollbar-thin min-h-0 overflow-y-auto border-r border-ink-800 p-3">
+      <div
+        className="grid min-h-0 flex-1 grid-cols-1"
+        style={{ gridTemplateColumns: settings.panels.left ? '320px 1fr' : '36px 1fr' }}
+      >
+        {!settings.panels.left ? (
+          <aside className="flex min-h-0 flex-col items-center gap-2 border-r border-ink-800 py-2">
+            <PanelToggle
+              title="展开设置面板"
+              onClick={() => patchSettings({ panels: { ...settings.panels, left: true } })}
+            >
+              ▸
+            </PanelToggle>
+            <span className="mt-1 select-none font-mono text-[9px] leading-tight text-ink-600" style={{ writingMode: 'vertical-rl' }}>
+              设置 / 评测
+            </span>
+          </aside>
+        ) : (
+        <aside className="scrollbar-thin relative min-h-0 overflow-y-auto border-r border-ink-800 p-3">
+          <div className="mb-2 flex justify-end">
+            <PanelToggle
+              title="收起设置面板，把画布放大"
+              onClick={() => patchSettings({ panels: { ...settings.panels, left: false } })}
+            >
+              ◂
+            </PanelToggle>
+          </div>
           <Controls
             settings={settings}
             onChange={patchSettings}
             running={running}
-            onRun={runSingle}
+            onRun={() => runSingle(board ? 'append' : 'new')}
             onCancel={cancel}
+            appending={Boolean(board)}
             onUpload={async (file) => setSourceImage(await fileToDataUrl(file))}
             sourceImage={sourceImage}
             onClearSource={() => setSourceImage(null)}
@@ -537,13 +649,15 @@ export default function Workbench() {
               selection={selection}
               onSelectionChange={setSelection}
               running={running}
-              onRun={runBenchmark}
+              onRun={() => runBenchmark(board ? 'append' : 'new')}
+              appending={Boolean(board)}
               composeElements={settings.compose.maxElements}
               decomposeElements={settings.decompose.maxElements}
               hasUpload={Boolean(sourceImage)}
             />
           </div>
         </aside>
+        )}
 
         <div className="flex min-h-0 min-w-0 flex-col">
           {board ? (
@@ -578,18 +692,38 @@ export default function Workbench() {
             )}
           </div>
 
-          <div className="scrollbar-thin max-h-44 shrink-0 overflow-y-auto border-t border-ink-800 bg-ink-900">
-            <div className="grid grid-cols-1 divide-y divide-ink-800 xl:grid-cols-2 xl:divide-x xl:divide-y-0">
-              <div className="p-3">
-                <h3 className="mb-2 font-mono text-[10px] uppercase tracking-widest text-ink-400">步骤（所有分支交错）</h3>
-                <StepLog steps={steps} />
-              </div>
-              <div className="min-w-0 p-3">
-                <h3 className="mb-2 font-mono text-[10px] uppercase tracking-widest text-ink-400">中间产物</h3>
-                <ArtifactStrip artifacts={artifacts} />
+          {settings.panels.bottom ? (
+            <div className="scrollbar-thin max-h-44 shrink-0 overflow-y-auto border-t border-ink-800 bg-ink-900">
+              <div className="grid grid-cols-1 divide-y divide-ink-800 xl:grid-cols-2 xl:divide-x xl:divide-y-0">
+                <div className="p-3">
+                  <div className="mb-2 flex items-center justify-between">
+                    <h3 className="font-mono text-[10px] uppercase tracking-widest text-ink-400">步骤（所有分支交错）</h3>
+                    <PanelToggle
+                      title="收起底部面板，把画布放大"
+                      onClick={() => patchSettings({ panels: { ...settings.panels, bottom: false } })}
+                    >
+                      ▾
+                    </PanelToggle>
+                  </div>
+                  <StepLog steps={steps} />
+                </div>
+                <div className="min-w-0 p-3">
+                  <h3 className="mb-2 font-mono text-[10px] uppercase tracking-widest text-ink-400">中间产物</h3>
+                  <ArtifactStrip artifacts={artifacts} />
+                </div>
               </div>
             </div>
-          </div>
+          ) : (
+            <button
+              onClick={() => patchSettings({ panels: { ...settings.panels, bottom: true } })}
+              className="flex shrink-0 items-center gap-2 border-t border-ink-800 bg-ink-900 px-3 py-1.5 text-left font-mono text-[10px] text-ink-400 transition hover:text-banana-400"
+            >
+              <span>▴</span>
+              <span>步骤与中间产物</span>
+              {steps.length ? <span className="text-ink-600">{steps.length} 步</span> : null}
+              {artifacts.length ? <span className="text-ink-600">· {artifacts.length} 张中间图</span> : null}
+            </button>
+          )}
         </div>
       </div>
 
@@ -603,5 +737,19 @@ export default function Workbench() {
         />
       ) : null}
     </main>
+  )
+}
+
+/** Collapse control for the side and bottom panels — the canvas is the point,
+ *  so everything around it has to be able to get out of the way. */
+function PanelToggle({ children, title, onClick }: { children: React.ReactNode; title: string; onClick: () => void }) {
+  return (
+    <button
+      title={title}
+      onClick={onClick}
+      className="rounded border border-ink-800 px-1.5 py-0.5 font-mono text-[10px] text-ink-500 transition hover:border-banana-500 hover:text-banana-400"
+    >
+      {children}
+    </button>
   )
 }

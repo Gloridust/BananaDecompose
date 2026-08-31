@@ -113,6 +113,7 @@ function syntheticBoard(swatch: string): Board {
     createdAt: 0,
     prompt: '一张咖啡品鉴会的海报',
     branchCount: arms.length,
+    rounds: 1,
     nodeCount: 0,
     totalMs: 0,
     serialMs: 0,

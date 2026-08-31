@@ -5,7 +5,7 @@ import { flatPrompt } from '../prompts'
 import { describeRuns, recoverText } from './text'
 import type { DecomposeOptions, ImageLayer, Layer, Scene, SceneAnalysis, UsageInfo } from '../types'
 import { api, boxToRect, checkCancelled, emit, hexOr, mapLimit, skip, track, tryTrack, type PipelineCtx } from './shared'
-import { PROMPT_NODE, aspectToSize, segment } from './compose'
+import { aspectToSize, segment, sharedNodes } from './compose'
 
 const SEG_CONCURRENCY = 8
 
@@ -19,9 +19,6 @@ const SEG_CONCURRENCY = 8
  */
 export type DecomposeResult = { scene: Scene; source: string; tailNodes: string[]; warnings: string[] }
 
-/** Every decompose branch of a board starts from the same flat raster. */
-export const SOURCE_NODE = 'n:source'
-
 /** Shared upstream for pipeline B: generate the flat raster once for every branch. */
 export async function prepareSource(
   ctx: PipelineCtx,
@@ -29,6 +26,7 @@ export async function prepareSource(
   opts: DecomposeOptions,
   models: { image: string },
 ): Promise<string> {
+  const N = sharedNodes(ctx.runKey)
   return track(
     ctx,
     'flat',
@@ -47,7 +45,7 @@ export async function prepareSource(
         images: [{ label: '来源平图', src: json.images[0] }],
       }
     },
-    { id: SOURCE_NODE, kind: 'source', inputs: [PROMPT_NODE] },
+    { id: N.source, kind: 'source', inputs: [N.prompt] },
   )
 }
 
@@ -61,6 +59,7 @@ export async function runDecompose(
   let height: number
   let flat: string
   const B = ctx.branchId
+  const N = sharedNodes(ctx.runKey)
 
   // 1 ── source raster
   if (input.sourceImage) {
@@ -72,11 +71,11 @@ export async function runDecompose(
     skip(ctx, 'flat', '来源图', `${origin} · ${width}×${height}`)
     ctx.onArtifact({ label: '来源平图', src: flat, role: 'source' })
     emit(ctx, {
-      id: SOURCE_NODE,
+      id: N.source,
       kind: 'source',
       label: '来源平图',
       detail: `${origin} · ${width}×${height}`,
-      inputs: [PROMPT_NODE],
+      inputs: [N.prompt],
       status: 'ok',
       images: [{ label: '来源平图', src: flat }],
     })
@@ -100,7 +99,7 @@ export async function runDecompose(
           images: [{ label: '来源平图', src: json.images[0] }],
         }
       },
-      { id: SOURCE_NODE, kind: 'source', inputs: [PROMPT_NODE] },
+      { id: N.source, kind: 'source', inputs: [N.prompt] },
     )
     const size = await imageSize(flat)
     width = size.width || planned.width
@@ -131,7 +130,7 @@ export async function runDecompose(
         summary: [els, txt].filter(Boolean).join('\n') || '什么都没读出来',
       }
     },
-    { id: analyzeNode, kind: 'analysis', inputs: [SOURCE_NODE] },
+    { id: analyzeNode, kind: 'analysis', inputs: [N.source] },
   )
 
   // 3 ── type. Measured before anything is erased, because the ink has to be
@@ -240,7 +239,7 @@ export async function runDecompose(
           images: [{ label: '重绘底片', src: json.image }],
         }
       },
-      { id: plateNode, kind: 'erase', inputs: [SOURCE_NODE, textNode] },
+      { id: plateNode, kind: 'erase', inputs: [N.source, textNode] },
       { value: null as unknown as string, note: '重建被拒，背景沿用原图（文字会重影）' },
     )
   } else {
@@ -249,7 +248,7 @@ export async function runDecompose(
       'inpaint',
       '背景重建',
       '没有要抬走的东西，背景沿用原图',
-      { id: plateNode, kind: 'erase', inputs: [SOURCE_NODE, textNode] },
+      { id: plateNode, kind: 'erase', inputs: [N.source, textNode] },
     )
   }
 
@@ -265,7 +264,7 @@ export async function runDecompose(
       kind: 'erase',
       label: '擦除文字与元素，重建背景',
       detail: `只在 ${textRegions.length} 处文字 + ${elementRegions.length} 处元素合成，其余像素与原图一致`,
-      inputs: [SOURCE_NODE, textNode],
+      inputs: [N.source, textNode],
       status: 'ok',
       images: [{ label: '最终背景板', src: plate }],
     })

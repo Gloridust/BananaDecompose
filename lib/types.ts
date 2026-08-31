@@ -242,6 +242,8 @@ export type BoardMeta = {
   thumbnail?: string
   branchCount: number
   nodeCount: number
+  /** How many rounds have been run onto this canvas. */
+  rounds: number
   /** Wall-clock for the whole board — branches overlap, so this is not a sum. */
   totalMs: number
   /** What the same work would have cost in wall-clock run one branch at a time. */

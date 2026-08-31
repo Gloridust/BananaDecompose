@@ -9,6 +9,8 @@ export const RESOLUTIONS = ['1K', '2K', '4K']
 export type Settings = {
   pipeline: PipelineId
   prompt: string
+  /** Panel visibility, kept so the canvas stays as large as you left it. */
+  panels: { left: boolean; bottom: boolean }
   /** Global cap on in-flight model calls, across every branch at once. */
   concurrency: number
   compose: ComposeOptions
@@ -18,6 +20,7 @@ export type Settings = {
 export const DEFAULT_SETTINGS: Settings = {
   pipeline: 'compose',
   concurrency: 4,
+  panels: { left: true, bottom: true },
   prompt: '一张咖啡品鉴会的海报：暖褐色纸质背景，一只手冲壶、一个陶瓷杯、几颗散落的咖啡豆，标题「晨间萃取」，副标题「周六 9:00 · 三号仓库」',
   compose: { matte: 'dual', text: 'live', aspectRatio: '4:5', resolution: '1K', maxElements: 4, visionModel: '' },
   decompose: { aspectRatio: '4:5', resolution: '1K', useMasks: true, fitGlyphs: true, refineText: true, textMode: 'pixel', maxElements: 6, groundingModel: '', visionModel: '' },
@@ -38,12 +41,15 @@ export default function Controls({
   sourceImage,
   onClearSource,
   models,
+  appending,
 }: {
   settings: Settings
   onChange: (patch: Partial<Settings>) => void
   running: boolean
   onRun: () => void
   onCancel: () => void
+  /** True when a canvas is already open, so this run adds a round to it. */
+  appending?: boolean
   onUpload: (file: File) => void
   sourceImage: string | null
   onClearSource: () => void
@@ -99,7 +105,7 @@ export default function Controls({
             running ? 'bg-rose-500/90 text-white hover:bg-rose-500' : 'bg-banana-500 text-ink-950 hover:bg-banana-400'
           }`}
         >
-          {running ? '取消运行' : sourceImage && !isCompose ? '拆解这张图' : '运行'}
+          {running ? '取消运行' : appending ? '追加一轮到当前画布' : sourceImage && !isCompose ? '拆解这张图' : '运行'}
         </button>
       </div>
 

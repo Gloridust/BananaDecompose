@@ -8,6 +8,7 @@ export default function BenchmarkPanel({
   onSelectionChange,
   running,
   onRun,
+  appending,
   composeElements,
   decomposeElements,
   hasUpload,
@@ -16,6 +17,8 @@ export default function BenchmarkPanel({
   onSelectionChange: (ids: string[]) => void
   running: boolean
   onRun: () => void
+  /** True when a canvas is already open, so this sweep adds a round to it. */
+  appending?: boolean
   composeElements: number
   decomposeElements: number
   hasUpload: boolean
@@ -86,7 +89,7 @@ export default function BenchmarkPanel({
         disabled={running || selection.length === 0}
         className="w-full rounded border border-banana-500 bg-banana-500/15 px-3 py-2 text-xs font-medium text-banana-400 transition hover:bg-banana-500/25 disabled:cursor-not-allowed disabled:opacity-40"
       >
-        {running ? '运行中…' : `一键评测 ${est.arms} 组方案`}
+        {running ? '运行中…' : appending ? `追加 ${est.arms} 组到当前画布` : `一键评测 ${est.arms} 组方案`}
       </button>
     </div>
   )

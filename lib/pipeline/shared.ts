@@ -11,6 +11,8 @@ export type PipelineCtx = {
   signal?: AbortSignal
   /** Namespaces per-branch node ids. */
   branchId: string
+  /** Namespaces the shared upstream nodes, so a board can hold several rounds. */
+  runKey: string
   /** Branches that consume the nodes this execution emits. The shared-upstream
    *  prepare phase lists every branch it feeds, so those nodes are drawn once
    *  and badged with how many chains depend on them. */

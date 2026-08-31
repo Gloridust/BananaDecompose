@@ -25,12 +25,17 @@ const ELEMENT_CONCURRENCY = 8
 /** Grounding masks arrive as base64 text; a smaller frame is a smaller payload. */
 export const SEGMENT_INPUT_MAX_DIM = 768
 
-// A board holds at most one shared plan and one shared text-free plate, so those
-// get fixed node ids and merge across branches automatically. Everything else is
-// namespaced by branch.
-export const PROMPT_NODE = 'n:prompt'
-export const PLAN_NODE = 'n:plan'
-export const PLATE_NODE = 'n:plate'
+// One round holds at most one shared plan and one shared text-free plate, so
+// those merge across the branches of that round. Scoping by round rather than by
+// board lets a canvas accumulate several rounds side by side.
+export function sharedNodes(runKey: string) {
+  return {
+    prompt: `n:${runKey}:prompt`,
+    plan: `n:${runKey}:plan`,
+    plate: `n:${runKey}:plate`,
+    source: `n:${runKey}:source`,
+  }
+}
 
 export type ComposeResult = {
   scene: Scene
@@ -48,6 +53,7 @@ export async function preparePlan(
   opts: ComposeOptions,
   size: { width: number; height: number },
 ): Promise<ScenePlan> {
+  const N = sharedNodes(ctx.runKey)
   return track(
     ctx,
     'plan',
@@ -69,7 +75,7 @@ export async function preparePlan(
         summary: planSummary(p),
       }
     },
-    { id: PLAN_NODE, kind: 'plan', inputs: [PROMPT_NODE] },
+    { id: N.plan, kind: 'plan', inputs: [N.prompt] },
   )
 }
 
@@ -81,6 +87,7 @@ export async function preparePlate(
   opts: ComposeOptions,
   models: { image: string },
 ): Promise<string> {
+  const N = sharedNodes(ctx.runKey)
   return track(
     ctx,
     'background',
@@ -95,7 +102,7 @@ export async function preparePlate(
       ctx.onArtifact({ label: '背景板', src: json.images[0], role: 'plate' })
       return { value: json.images[0], usage: json.usage, images: [{ label: '背景板', src: json.images[0] }] }
     },
-    { id: PLATE_NODE, kind: 'plate', inputs: [PLAN_NODE] },
+    { id: N.plate, kind: 'plate', inputs: [N.plan] },
   )
 }
 
@@ -118,6 +125,7 @@ export async function runCompose(
 ): Promise<ComposeResult> {
   const { width, height } = aspectToSize(opts.aspectRatio, opts.resolution)
   const B = ctx.branchId
+  const N = sharedNodes(ctx.runKey)
 
   // 1 ── plan
   let plan: ScenePlan
@@ -125,10 +133,10 @@ export async function runCompose(
     const reused = shared.plan
     skip(ctx, 'plan', '规划 Scene JSON', `复用共享规划（${reused.elements.length} 元素 / ${reused.texts.length} 文字）`)
     emit(ctx, {
-      id: PLAN_NODE,
+      id: N.plan,
       kind: 'plan',
       label: '规划 Scene JSON',
-      inputs: [PROMPT_NODE],
+      inputs: [N.prompt],
       status: 'ok',
       summary: planSummary(reused),
     })
@@ -139,7 +147,7 @@ export async function runCompose(
 
   const bakeText = opts.text === 'baked'
   // The baked arm renders copy into its plate, so it cannot share one.
-  const plateNode = bakeText ? `n:${B}:plate` : PLATE_NODE
+  const plateNode = bakeText ? `n:${B}:plate` : N.plate
 
   // 2 ── background plate
   let bgSrc: string
@@ -152,7 +160,7 @@ export async function runCompose(
       kind: 'plate',
       label: '背景板',
       detail: '复用共享背景板',
-      inputs: [PLAN_NODE],
+      inputs: [N.plan],
       status: 'ok',
       images: [{ label: '背景板', src: bgSrc }],
     })
@@ -179,7 +187,7 @@ export async function runCompose(
         ctx.onArtifact({ label: '背景板', src: json.images[0], role: 'plate' })
         return { value: json.images[0], usage: json.usage, images: [{ label: '背景板', src: json.images[0] }] }
       },
-      { id: plateNode, kind: 'plate', inputs: [PLAN_NODE] },
+      { id: plateNode, kind: 'plate', inputs: [N.plan] },
     )
   }
 
@@ -196,7 +204,7 @@ export async function runCompose(
       kind: 'renders',
       label: `独立渲染 ×${plan.elements.length}`,
       detail: backdropLabel(opts.matte),
-      inputs: [PLAN_NODE],
+      inputs: [N.plan],
       status: 'running',
       images: [...rawShots],
     })
@@ -207,7 +215,7 @@ export async function runCompose(
     kind: 'renders',
     label: `独立渲染 ×${plan.elements.length}`,
     detail: backdropLabel(opts.matte),
-    inputs: [PLAN_NODE],
+    inputs: [N.plan],
     status: 'running',
   })
   emit(ctx, {
@@ -303,7 +311,7 @@ export async function runCompose(
     kind: 'renders',
     label: `独立渲染 ×${plan.elements.length}`,
     detail: backdropLabel(opts.matte),
-    inputs: [PLAN_NODE],
+    inputs: [N.plan],
     status: 'ok',
     images: [...rawShots],
   })
