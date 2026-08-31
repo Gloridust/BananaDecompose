@@ -1,13 +1,3 @@
-import type { MatteStrategy } from './types'
-
-export const BACKDROPS: Record<Exclude<MatteStrategy, 'none'> | 'flat', string> = {
-  dual: '',
-  chroma: 'pure saturated magenta #FF00FF',
-  'vlm-mask': 'plain neutral mid-grey #808080',
-  native: '',
-  flat: '',
-}
-
 /** Shared rule: keep glyphs out of the raster so text stays a real text node. */
 const NO_TEXT_RULE = `Absolutely no lettering, words, numbers, captions, watermarks, logos with type, or any written glyphs anywhere in the image. If the concept implies text, render the empty container or surface instead and leave that area visually clean and uncluttered.`
 
@@ -120,13 +110,12 @@ export function backgroundPrompt(p: string) {
   return `${p}\n\nFull-bleed background plate only. ${NO_TEXT_RULE}`
 }
 
-export function elementPrompt(p: string, backdrop: 'white' | 'black' | 'magenta' | 'grey' | 'none') {
+export function elementPrompt(p: string, backdrop: 'white' | 'black' | 'magenta' | 'grey') {
   const backdropText: Record<typeof backdrop, string> = {
     white: 'Place it on a completely flat, uniform PURE WHITE (#FFFFFF) background that fills the entire frame edge to edge.',
     black: 'Place it on a completely flat, uniform PURE BLACK (#000000) background that fills the entire frame edge to edge.',
     magenta: 'Place it on a completely flat, uniform PURE MAGENTA (#FF00FF) background that fills the entire frame edge to edge. No magenta anywhere on the subject itself.',
     grey: 'Place it on a completely flat, uniform NEUTRAL GREY (#808080) background that fills the entire frame edge to edge.',
-    none: 'Transparent background.',
   }
 
   return `${p}
@@ -232,17 +221,23 @@ export const ANALYZE_SCHEMA = {
   },
 } as const
 
-/** Gemini's native grounding format: box_2d + base64 PNG mask, per the image-understanding docs. */
-export function segmentPrompt(labels: string[]) {
-  return `Give the segmentation masks for these items in the image: ${labels.map((l) => `"${l}"`).join(', ')}.
+/**
+ * Gemini's native grounding format: box_2d + base64 PNG mask.
+ *
+ * Deliberately one object per call. A mask arrives as base64 text in the completion
+ * stream, so batching several into one response pushes the output into the tens of
+ * thousands of tokens — measured at over 170s before timing out.
+ */
+export function segmentPrompt(label: string) {
+  return `Give the segmentation mask for "${label}" in this image.
 
-Output a JSON list. Each entry must have:
-- "label": the item's label, matching one of the strings above exactly
+Output a JSON list containing exactly ONE entry, with:
+- "label": "${label}"
 - "box_2d": [y0, x0, y1, x1] normalised to 0..1000
-- "mask": a base64-encoded PNG of the mask, where each pixel is the 0-255 probability that the
-  pixel belongs to the object, in the coordinate space of that entry's own box_2d crop
+- "mask": a base64-encoded PNG of the mask, where each pixel is the 0-255 probability that
+  the pixel belongs to the object, in the coordinate space of that entry's own box_2d crop
 
-Emit one entry per requested item, in the order listed. Output only the JSON list.`
+Keep the mask compact. Output only the JSON list, nothing else.`
 }
 
 // -------------------------------------------------------------- erase

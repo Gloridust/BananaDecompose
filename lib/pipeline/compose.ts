@@ -1,6 +1,6 @@
 'use client'
 
-import { chromaKeyMatte, cropBox, dualRenderMatte, imageSize, maskMatte, type MatteResult } from '../matte'
+import { chromaKeyMatte, cropBox, downscale, dualRenderMatte, imageSize, maskMatte, type MatteResult } from '../matte'
 import type {
   ComposeOptions,
   ImageLayer,
@@ -17,6 +17,8 @@ import { boxToRect, checkCancelled, hexOr, mapLimit, skip, track, type PipelineC
 type GenRes = { images: string[]; usage: UsageInfo; model: string }
 
 const ELEMENT_CONCURRENCY = 2
+/** Grounding masks arrive as base64 text; a smaller frame is a smaller payload. */
+export const SEGMENT_INPUT_MAX_DIM = 768
 
 /**
  * Pipeline A — "never flatten".
@@ -25,59 +27,79 @@ const ELEMENT_CONCURRENCY = 2
  * backdrop, recover alpha locally, and keep type as real text nodes. Editability
  * is structural rather than recovered, so nothing has to be un-baked afterwards.
  */
+export type ComposeResult = { scene: Scene; plan: ScenePlan; background: string }
+
 export async function runCompose(
   ctx: PipelineCtx,
   prompt: string,
   opts: ComposeOptions,
   models: { image: string; vision: string; grounding: string },
-): Promise<Scene> {
+  /** Reuse upstream artefacts from an earlier arm so only the matting strategy
+   *  varies. The background plate is independent of how elements get matted, so
+   *  regenerating it per arm would only add cost and noise. */
+  shared?: { plan?: ScenePlan; background?: string },
+): Promise<ComposeResult> {
   const { width, height } = aspectToSize(opts.aspectRatio, opts.resolution)
 
   // 1 ── plan
-  const plan = await track(ctx, 'plan', '规划 Scene JSON', async () => {
-    const res = await fetch('/api/plan', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        prompt,
-        width,
-        height,
-        maxElements: opts.maxElements,
-        textStrategy: opts.text,
-        model: opts.visionModel || undefined,
-      }),
-      signal: ctx.signal,
+  let plan: ScenePlan
+  if (shared?.plan) {
+    skip(ctx, 'plan', '规划 Scene JSON', `复用上一轮的规划（${shared.plan.elements.length} 元素 / ${shared.plan.texts.length} 文字），保证只有抠图策略在变`)
+    plan = shared.plan
+  } else {
+    plan = await track(ctx, 'plan', '规划 Scene JSON', async () => {
+      const res = await fetch('/api/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt,
+          width,
+          height,
+          maxElements: opts.maxElements,
+          textStrategy: opts.text,
+          model: opts.visionModel || undefined,
+        }),
+        signal: ctx.signal,
+      })
+      const json = await res.json()
+      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+      const p = json.plan as ScenePlan
+      return {
+        value: p,
+        usage: json.usage as UsageInfo,
+        detail: `${p.elements.length} 个元素 · ${p.texts.length} 段文字`,
+      }
     })
-    const json = await res.json()
-    if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-    const p = json.plan as ScenePlan
-    return {
-      value: p,
-      usage: json.usage as UsageInfo,
-      detail: `${p.elements.length} 个元素 · ${p.texts.length} 段文字`,
-    }
-  })
+  }
 
   const bakeText = opts.text === 'baked'
 
-  // 2 ── background plate
-  const bgSrc = await track(ctx, 'background', bakeText ? '生成背景（文字烘焙进像素）' : '生成背景板', async () => {
-    const basePrompt = backgroundPrompt(plan.background.prompt)
-    const withCopy = bakeText && plan.texts.length
-      ? `${plan.background.prompt}\n\nRender this copy into the artwork, crisply and legibly, laid out as described:\n${plan.texts
-          .map((t) => `- "${t.content}" (${t.fontFamily} ${t.fontWeight}, ${t.color})`)
-          .join('\n')}`
-      : basePrompt
+  // 2 ── background plate. Shareable only when text stays out of the raster —
+  // the baked arm needs its own plate with the copy rendered in.
+  let bgSrc: string
+  if (shared?.background && !bakeText) {
+    skip(ctx, 'background', '生成背景板', '复用上一轮的背景板 —— 抠图策略不影响背景')
+    bgSrc = shared.background
+    ctx.onArtifact({ label: '背景板（复用）', src: bgSrc, role: 'plate' })
+  } else {
+    bgSrc = await track(ctx, 'background', bakeText ? '生成背景（文字烘焙进像素）' : '生成背景板', async () => {
+      const basePrompt = backgroundPrompt(plan.background.prompt)
+      const withCopy = bakeText && plan.texts.length
+        ? `${plan.background.prompt}\n\nRender this copy into the artwork, crisply and legibly, laid out as described:\n${plan.texts
+            .map((t) => `- "${t.content}" (${t.fontFamily} ${t.fontWeight}, ${t.color})`)
+            .join('\n')}`
+        : basePrompt
 
-    const json = await gen(ctx, {
-      prompt: withCopy,
-      aspectRatio: opts.aspectRatio,
-      resolution: opts.resolution,
-      model: models.image,
+      const json = await gen(ctx, {
+        prompt: withCopy,
+        aspectRatio: opts.aspectRatio,
+        resolution: opts.resolution,
+        model: models.image,
+      })
+      ctx.onArtifact({ label: '背景板', src: json.images[0], role: 'plate' })
+      return { value: json.images[0], usage: json.usage }
     })
-    ctx.onArtifact({ label: '背景板', src: json.images[0] })
-    return { value: json.images[0], usage: json.usage }
-  })
+  }
 
   // 3 ── elements, each rendered alone then matted
   const elementLayers = await mapLimit(plan.elements, ELEMENT_CONCURRENCY, async (el, i) => {
@@ -86,6 +108,7 @@ export async function runCompose(
       return await track(ctx, stepId, `元素 ${i + 1}/${plan.elements.length}：${el.name}`, async () => {
         const usage: UsageInfo = { cost: 0 }
         let matte: MatteResult
+        let degraded: string | null = null
 
         if (opts.matte === 'dual') {
           const [white, black] = await Promise.all([
@@ -93,39 +116,27 @@ export async function runCompose(
             gen(ctx, { prompt: elementPrompt(el.prompt, 'black'), aspectRatio: '1:1', resolution: opts.resolution, model: models.image, seed: 1000 + i }),
           ])
           usage.cost = white.usage.cost + black.usage.cost
-          ctx.onArtifact({ label: `${el.name} · 白底`, src: white.images[0] })
-          ctx.onArtifact({ label: `${el.name} · 黑底`, src: black.images[0] })
+          ctx.onArtifact({ label: `${el.name} · 白底`, src: white.images[0], role: 'raw' })
+          ctx.onArtifact({ label: `${el.name} · 黑底`, src: black.images[0], role: 'raw' })
           matte = await dualRenderMatte(white.images[0], black.images[0])
         } else if (opts.matte === 'chroma') {
           const res = await gen(ctx, { prompt: elementPrompt(el.prompt, 'magenta'), aspectRatio: '1:1', resolution: opts.resolution, model: models.image, seed: 1000 + i })
           usage.cost = res.usage.cost
-          ctx.onArtifact({ label: `${el.name} · 品红底`, src: res.images[0] })
+          ctx.onArtifact({ label: `${el.name} · 品红底`, src: res.images[0], role: 'raw' })
           matte = await chromaKeyMatte(res.images[0])
-        } else if (opts.matte === 'vlm-mask') {
+        } else {
           const res = await gen(ctx, { prompt: elementPrompt(el.prompt, 'grey'), aspectRatio: '1:1', resolution: opts.resolution, model: models.image, seed: 1000 + i })
           usage.cost = res.usage.cost
-          ctx.onArtifact({ label: `${el.name} · 灰底`, src: res.images[0] })
-          const seg = await segment(ctx, res.images[0], [el.name], models.grounding)
-          usage.cost += seg.usage.cost
-          const hit = seg.masks[0]
-          matte = hit
-            ? await maskMatte(res.images[0], hit.mask, hit.box)
-            : await cropBox(res.images[0], [0, 0, 1000, 1000])
-        } else {
-          const res = await gen(ctx, {
-            prompt: elementPrompt(el.prompt, 'none'),
-            aspectRatio: '1:1',
-            resolution: opts.resolution,
-            model: models.image,
-            background: 'transparent',
-            seed: 1000 + i,
-          })
-          usage.cost = res.usage.cost
-          ctx.onArtifact({ label: `${el.name} · 原生透明`, src: res.images[0] })
-          matte = await cropBox(res.images[0], [0, 0, 1000, 1000])
+          ctx.onArtifact({ label: `${el.name} · 灰底`, src: res.images[0], role: 'raw' })
+          const seg = await segment(ctx, res.images[0], el.name, models.grounding)
+          usage.cost += seg.usage?.cost ?? 0
+          matte = seg.mask
+            ? await maskMatte(res.images[0], seg.mask, seg.box ?? [0, 0, 1000, 1000])
+            : await cropBox(res.images[0], seg.box ?? [0, 0, 1000, 1000])
+          if (seg.degraded) degraded = seg.reason ?? '掩码不可用，已降级为矩形裁切'
         }
 
-        ctx.onArtifact({ label: `${el.name} · 抠图结果`, src: matte.src })
+        ctx.onArtifact({ label: `${el.name} · 抠图结果`, src: matte.src, role: 'cut' })
 
         const target = boxToRect(el.box, width, height)
         const size = await imageSize(matte.src)
@@ -148,7 +159,7 @@ export async function runCompose(
         return {
           value: layer,
           usage,
-          detail: `覆盖率 ${(matte.coverage * 100).toFixed(0)}%`,
+          detail: degraded ? `覆盖率 ${(matte.coverage * 100).toFixed(0)}% · ${degraded}` : `覆盖率 ${(matte.coverage * 100).toFixed(0)}%`,
         }
       })
     } catch (err) {
@@ -189,7 +200,7 @@ export async function runCompose(
       })
       const json = await res.json()
       if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-      ctx.onArtifact({ label: '擦除后的背景板', src: json.image })
+      ctx.onArtifact({ label: '擦除后的背景板', src: json.image, role: 'plate' })
       return { value: json.image as string, usage: json.usage as UsageInfo }
     })
 
@@ -217,8 +228,12 @@ export async function runCompose(
   const layers: Layer[] = [background, ...elements, ...textLayers]
 
   return {
-    canvas: { width, height, background: hexOr(plan.background.dominantColor, '#111114') },
-    layers,
+    scene: {
+      canvas: { width, height, background: hexOr(plan.background.dominantColor, '#111114') },
+      layers,
+    },
+    plan,
+    background: bgSrc,
   }
 }
 
@@ -239,20 +254,28 @@ async function gen(
   return json as GenRes
 }
 
-async function segment(ctx: PipelineCtx, image: string, labels: string[], model: string) {
+export type SegmentResult = {
+  label: string
+  box: [number, number, number, number] | null
+  mask: string | null
+  usage: UsageInfo
+  degraded: boolean
+  reason?: string
+}
+
+/** One object per call. The image is downscaled first: the model's mask comes back
+ *  as base64 text, so a smaller frame is a directly smaller — and faster — payload. */
+export async function segment(ctx: PipelineCtx, image: string, label: string, model: string): Promise<SegmentResult> {
+  const small = await downscale(image, SEGMENT_INPUT_MAX_DIM)
   const res = await fetch('/api/segment', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image, labels, model }),
+    body: JSON.stringify({ image: small, label, model }),
     signal: ctx.signal,
   })
   const json = await res.json()
   if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-  return json as {
-    masks: { label: string; box: [number, number, number, number]; mask: string | null }[]
-    usage: UsageInfo
-    degraded: boolean
-  }
+  return json as SegmentResult
 }
 
 /** Scale a subject into its planned box without distorting it. */

@@ -52,15 +52,21 @@ export type MatteStrategy =
   | 'dual'      // render twice (white bg + black bg), solve for alpha by difference
   | 'chroma'    // render once on a saturated key colour, chroma-key it out
   | 'vlm-mask'  // render once, ask the vision model for a segmentation mask
-  | 'native'    // trust the provider's `background: transparent` flag
   | 'none'      // opaque plate (backgrounds)
 
 export const MATTE_STRATEGIES: { id: MatteStrategy; label: string; note: string }[] = [
   { id: 'dual', label: '双渲染差值', note: '白底 + 黑底各生成一次，解方程求 alpha。边缘/半透明最准，2× 成本。' },
   { id: 'chroma', label: '色键抠图', note: '在纯品红底上生成一次，按色距抠除。1× 成本，边缘有色溢。' },
   { id: 'vlm-mask', label: 'VLM 分割掩码', note: '生成一次 + Gemini 返回 segmentation mask。1× 成本 + 1 次视觉调用。' },
-  { id: 'native', label: '原生透明', note: '直接请求 background=transparent。Gemini 系不支持，留作对照组。' },
 ]
+
+/** Backdrop each strategy renders against — the metrics need it to measure spill. */
+export const MATTE_BACKDROP: Record<MatteStrategy, [number, number, number] | null> = {
+  dual: [0, 0, 0], // the black plate is what survives into the premultiplied colour
+  chroma: [255, 0, 255],
+  'vlm-mask': [128, 128, 128],
+  none: null,
+}
 
 export type TextStrategy = 'live' | 'baked'
 
@@ -126,13 +132,49 @@ export type RunMeta = {
   options: ComposeOptions | DecomposeOptions
   models: { image: string; vision: string; grounding: string }
   failed?: boolean
+  metrics?: RunMetrics
+  /** Set when this run was one arm of a one-click benchmark sweep. */
+  benchmark?: BenchmarkRef
+}
+
+export type Artifact = {
+  label: string
+  src: string
+  /** 'source' is the flat raster a decompose run started from — the metrics
+   *  reference. 'plate' is the final background. 'cut' is a matted element. */
+  role?: 'source' | 'plate' | 'raw' | 'cut'
+}
+
+/** Automatically measured so "which strategy is better" is a number, not a vibe. */
+export type RunMetrics = {
+  imageLayers: number
+  textLayers: number
+  /** True when no text ever entered a raster — the headline editability claim. */
+  liveText: boolean
+  /** Mean fraction of an element's non-empty pixels that are partially transparent.
+   *  Real feathering survives; a hard key flattens this toward zero. */
+  softEdgeRatio: number | null
+  /** Mean fraction of the element frame that survived matting. */
+  alphaCoverage: number | null
+  /** Mean backdrop contamination among retained pixels, 0..1. Lower is better. */
+  spill: number | null
+  /** Reconstruction fidelity against the source raster. Decompose runs only. */
+  psnr: number | null
+  l1: number | null
+}
+
+export type BenchmarkRef = {
+  id: string
+  label: string
+  index: number
+  total: number
 }
 
 export type Run = RunMeta & {
   scene: Scene
   steps: RunStep[]
   /** Raw intermediates, kept so the two pipelines can be inspected side by side. */
-  artifacts: { label: string; src: string }[]
+  artifacts: Artifact[]
 }
 
 // ---------- API wire types ----------

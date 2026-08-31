@@ -5,23 +5,61 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Controls, { DEFAULT_SETTINGS, type Settings } from './Controls'
 import Stage from './Stage'
 import { ArtifactStrip, Inspector, LayerList, Section, StepLog } from './Panels'
+import BenchmarkPanel from './BenchmarkPanel'
+import { MetricRow } from './Metrics'
 import { download, downloadJson, downloadSvg, sceneToPng } from '@/lib/export'
 import { getRun, loadSettings, newRunId, saveRun, saveSettings } from '@/lib/history'
+import { computeMetrics } from '@/lib/metrics'
 import { fileToDataUrl, thumbnail } from '@/lib/matte'
 import { runCompose } from '@/lib/pipeline/compose'
 import { runDecompose } from '@/lib/pipeline/decompose'
 import type { PipelineCtx } from '@/lib/pipeline/shared'
-import type { Layer, Run, RunStep, Scene } from '@/lib/types'
+import { DEFAULT_SELECTION, VARIANTS, resolveOptions } from '@/lib/benchmark'
+import type {
+  Artifact,
+  BenchmarkRef,
+  ComposeOptions,
+  DecomposeOptions,
+  Layer,
+  PipelineId,
+  Run,
+  RunMetrics,
+  RunStep,
+  Scene,
+  ScenePlan,
+} from '@/lib/types'
 
 type Models = { image: string; vision: string; grounding: string }
+
+type RunConfig = {
+  pipeline: PipelineId
+  prompt: string
+  compose: ComposeOptions
+  decompose: DecomposeOptions
+  sourceImage?: string
+  shared?: { plan?: ScenePlan; background?: string }
+  benchmark?: BenchmarkRef
+}
+
+type RunOutcome = {
+  scene: Scene | null
+  plan?: ScenePlan
+  background?: string
+  source?: string
+  metrics?: RunMetrics
+}
 
 export default function Workbench() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS)
   const [hydrated, setHydrated] = useState(false)
   const [scene, setScene] = useState<Scene | null>(null)
   const [steps, setSteps] = useState<RunStep[]>([])
-  const [artifacts, setArtifacts] = useState<{ label: string; src: string }[]>([])
+  const [artifacts, setArtifacts] = useState<Artifact[]>([])
+  const [metrics, setMetrics] = useState<RunMetrics | null>(null)
   const [running, setRunning] = useState(false)
+  const [benchProgress, setBenchProgress] = useState<{ label: string; index: number; total: number } | null>(null)
+  const [benchDone, setBenchDone] = useState<string | null>(null)
+  const [selection, setSelection] = useState<string[]>(DEFAULT_SELECTION)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [sourceImage, setSourceImage] = useState<string | null>(null)
   const [showOutlines, setShowOutlines] = useState(true)
@@ -43,6 +81,7 @@ export default function Workbench() {
         setScene(prev.scene)
         setSteps(prev.steps)
         setArtifacts(prev.artifacts)
+        setMetrics(prev.metrics ?? null)
         setTotals({ cost: prev.totalCost, ms: prev.totalMs })
         setSettings((cur) => ({ ...cur, pipeline: prev.pipeline, prompt: prev.prompt }))
       })
@@ -65,87 +104,181 @@ export default function Workbench() {
     setSettings((prev) => ({ ...prev, ...patch }))
   }, [])
 
+  // ----------------------------------------------------- one execution
+
+  const executeRun = useCallback(
+    async (cfg: RunConfig, signal: AbortSignal): Promise<RunOutcome> => {
+      if (!models) return { scene: null }
+
+      setError(null)
+      setSteps([])
+      setArtifacts([])
+      setScene(null)
+      setMetrics(null)
+      setSelectedId(null)
+      setTotals({ cost: 0, ms: 0 })
+
+      const collected: RunStep[] = []
+      const collectedArtifacts: Artifact[] = []
+      const runTotals = { cost: 0, ms: 0 }
+
+      const ctx: PipelineCtx = {
+        signal,
+        totals: runTotals,
+        onStep: (step) => {
+          const i = collected.findIndex((s) => s.id === step.id)
+          if (i === -1) collected.push(step)
+          else collected[i] = step
+          setSteps([...collected])
+          setTotals({ ...runTotals })
+        },
+        onArtifact: (a) => {
+          collectedArtifacts.push(a)
+          setArtifacts([...collectedArtifacts])
+        },
+      }
+
+      const startedAt = performance.now()
+      const outcome: RunOutcome = { scene: null }
+      let failed = false
+
+      try {
+        if (cfg.pipeline === 'compose') {
+          const res = await runCompose(ctx, cfg.prompt, cfg.compose, models, cfg.shared)
+          outcome.scene = res.scene
+          outcome.plan = res.plan
+          outcome.background = res.background
+        } else {
+          const res = await runDecompose(ctx, { prompt: cfg.prompt, sourceImage: cfg.sourceImage }, cfg.decompose, models)
+          outcome.scene = res.scene
+          outcome.source = res.source
+        }
+        setScene(outcome.scene)
+      } catch (err) {
+        failed = true
+        if ((err as Error).name !== 'Cancelled') setError((err as Error).message)
+      }
+
+      if (outcome.scene) {
+        try {
+          outcome.metrics = await computeMetrics(outcome.scene, collectedArtifacts, {
+            matte: cfg.pipeline === 'compose' ? cfg.compose.matte : undefined,
+            liveText: cfg.pipeline === 'compose' && cfg.compose.text === 'live',
+          })
+          setMetrics(outcome.metrics)
+        } catch {
+          /* metrics are diagnostics, never a reason to lose the scene */
+        }
+
+        try {
+          const flattened = await sceneToPng(outcome.scene)
+          const record: Run = {
+            id: newRunId(),
+            createdAt: Date.now(),
+            pipeline: cfg.pipeline,
+            prompt: cfg.sourceImage && cfg.pipeline === 'decompose' ? `${cfg.prompt} (上传图)` : cfg.prompt,
+            thumbnail: await thumbnail(flattened, 400),
+            layerCount: outcome.scene.layers.length,
+            textLayerCount: outcome.scene.layers.filter((l) => l.type === 'text').length,
+            totalMs: Math.round(performance.now() - startedAt),
+            totalCost: runTotals.cost,
+            options: cfg.pipeline === 'compose' ? cfg.compose : cfg.decompose,
+            models,
+            failed,
+            metrics: outcome.metrics,
+            benchmark: cfg.benchmark,
+            scene: outcome.scene,
+            steps: collected,
+            artifacts: collectedArtifacts,
+          }
+          await saveRun(record)
+        } catch {
+          /* history is a convenience, never block the result on it */
+        }
+      }
+
+      return outcome
+    },
+    [models],
+  )
+
   // ------------------------------------------------------------- run
 
   const run = useCallback(async () => {
-    if (!models) return
     const controller = new AbortController()
     abortRef.current = controller
-
     setRunning(true)
-    setError(null)
-    setSteps([])
-    setArtifacts([])
-    setScene(null)
-    setSelectedId(null)
-    setTotals({ cost: 0, ms: 0 })
-
-    const collected: RunStep[] = []
-    const collectedArtifacts: { label: string; src: string }[] = []
-    const runTotals = { cost: 0, ms: 0 }
-
-    const ctx: PipelineCtx = {
-      signal: controller.signal,
-      totals: runTotals,
-      onStep: (step) => {
-        const i = collected.findIndex((s) => s.id === step.id)
-        if (i === -1) collected.push(step)
-        else collected[i] = step
-        setSteps([...collected])
-        setTotals({ ...runTotals })
-      },
-      onArtifact: (a) => {
-        collectedArtifacts.push(a)
-        setArtifacts([...collectedArtifacts])
-      },
-    }
-
-    const startedAt = performance.now()
-    let produced: Scene | null = null
-    let failed = false
-
+    setBenchDone(null)
     try {
-      produced =
-        settings.pipeline === 'compose'
-          ? await runCompose(ctx, settings.prompt, settings.compose, models)
-          : await runDecompose(ctx, { prompt: settings.prompt, sourceImage: sourceImage ?? undefined }, settings.decompose, models)
-      setScene(produced)
-    } catch (err) {
-      failed = true
-      const msg = (err as Error).message
-      if ((err as Error).name !== 'Cancelled') setError(msg)
+      await executeRun(
+        {
+          pipeline: settings.pipeline,
+          prompt: settings.prompt,
+          compose: settings.compose,
+          decompose: settings.decompose,
+          sourceImage: sourceImage ?? undefined,
+        },
+        controller.signal,
+      )
     } finally {
       setRunning(false)
       abortRef.current = null
     }
+  }, [executeRun, settings, sourceImage])
 
-    if (produced) {
-      try {
-        const flattened = await sceneToPng(produced)
-        const thumb = await thumbnail(flattened, 400)
-        const record: Run = {
-          id: newRunId(),
-          createdAt: Date.now(),
-          pipeline: settings.pipeline,
-          prompt: sourceImage && settings.pipeline === 'decompose' ? `${settings.prompt} (上传图)` : settings.prompt,
-          thumbnail: thumb,
-          layerCount: produced.layers.length,
-          textLayerCount: produced.layers.filter((l) => l.type === 'text').length,
-          totalMs: Math.round(performance.now() - startedAt),
-          totalCost: runTotals.cost,
-          options: settings.pipeline === 'compose' ? settings.compose : settings.decompose,
-          models,
-          failed,
-          scene: produced,
-          steps: collected,
-          artifacts: collectedArtifacts,
+  // ------------------------------------------------------- benchmark
+
+  const runBenchmark = useCallback(async () => {
+    const arms = VARIANTS.filter((v) => selection.includes(v.id))
+    if (!arms.length) return
+
+    const controller = new AbortController()
+    abortRef.current = controller
+    setRunning(true)
+    setBenchDone(null)
+
+    const benchmarkId = newRunId()
+    // Held constant across arms of the same pipeline so each row differs by one thing.
+    let sharedPlan: ScenePlan | undefined
+    let sharedBackground: string | undefined
+    let sharedSource: string | undefined = sourceImage ?? undefined
+    let completed = 0
+
+    try {
+      for (let i = 0; i < arms.length; i++) {
+        if (controller.signal.aborted) break
+        const arm = arms[i]
+        setBenchProgress({ label: arm.label, index: i + 1, total: arms.length })
+
+        const opts = resolveOptions(arm, { compose: settings.compose, decompose: settings.decompose })
+        const outcome = await executeRun(
+          {
+            pipeline: arm.pipeline,
+            prompt: settings.prompt,
+            compose: opts.compose,
+            decompose: opts.decompose,
+            sourceImage: arm.pipeline === 'decompose' ? sharedSource : undefined,
+            shared: arm.pipeline === 'compose' ? { plan: sharedPlan, background: sharedBackground } : undefined,
+            benchmark: { id: benchmarkId, label: arm.label, index: i + 1, total: arms.length },
+          },
+          controller.signal,
+        )
+
+        if (outcome.plan && !sharedPlan) sharedPlan = outcome.plan
+        // Only a text-free plate is reusable; the baked arm bakes copy into its own.
+        if (outcome.background && !sharedBackground && opts.compose.text === 'live') {
+          sharedBackground = outcome.background
         }
-        await saveRun(record)
-      } catch {
-        /* history is a convenience, never block the result on it */
+        if (outcome.source && !sharedSource) sharedSource = outcome.source
+        if (outcome.scene) completed++
       }
+      if (completed) setBenchDone(benchmarkId)
+    } finally {
+      setRunning(false)
+      setBenchProgress(null)
+      abortRef.current = null
     }
-  }, [models, settings, sourceImage])
+  }, [executeRun, selection, settings, sourceImage])
 
   const cancel = useCallback(() => abortRef.current?.abort(), [])
 
@@ -169,13 +302,10 @@ export default function Workbench() {
     })
   }, [])
 
-  const deleteLayer = useCallback(
-    (id: string) => {
-      setScene((prev) => (prev ? { ...prev, layers: prev.layers.filter((l) => l.id !== id) } : prev))
-      setSelectedId((cur) => (cur === id ? null : cur))
-    },
-    [],
-  )
+  const deleteLayer = useCallback((id: string) => {
+    setScene((prev) => (prev ? { ...prev, layers: prev.layers.filter((l) => l.id !== id) } : prev))
+    setSelectedId((cur) => (cur === id ? null : cur))
+  }, [])
 
   const selected = useMemo(() => scene?.layers.find((l) => l.id === selectedId) ?? null, [scene, selectedId])
 
@@ -210,12 +340,25 @@ export default function Workbench() {
           <code className="font-mono">.env.local</code> 填上 key，然后重启 dev server。
         </div>
       ) : null}
+      {benchProgress ? (
+        <div className="shrink-0 border-b border-banana-500/40 bg-banana-500/10 px-4 py-2 text-xs text-banana-200">
+          一键评测运行中 · 第 {benchProgress.index}/{benchProgress.total} 组：{benchProgress.label}
+          <span className="ml-2 text-banana-400/70">每组结果都会存进历史记录，跑完可并排对比</span>
+        </div>
+      ) : null}
+      {benchDone ? (
+        <div className="flex shrink-0 items-center gap-3 border-b border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-xs text-emerald-200">
+          评测完成。
+          <Link href={`/history?benchmark=${benchDone}`} className="rounded border border-emerald-500/60 px-2 py-0.5 hover:bg-emerald-500/20">
+            查看对比表 →
+          </Link>
+        </div>
+      ) : null}
       {error ? (
         <div className="shrink-0 border-b border-rose-500/40 bg-rose-500/10 px-4 py-2 text-xs text-rose-200">{error}</div>
       ) : null}
 
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[320px_1fr_300px]">
-        {/* left: controls */}
         <aside className="scrollbar-thin min-h-0 overflow-y-auto border-r border-ink-800 p-3">
           <Controls
             settings={settings}
@@ -228,27 +371,33 @@ export default function Workbench() {
             onClearSource={() => setSourceImage(null)}
             models={models}
           />
+          <div className="mt-4 border-t border-ink-800 pt-4">
+            <BenchmarkPanel
+              selection={selection}
+              onSelectionChange={setSelection}
+              running={running}
+              onRun={runBenchmark}
+              composeElements={settings.compose.maxElements}
+              decomposeElements={settings.decompose.maxElements}
+              hasUpload={Boolean(sourceImage)}
+            />
+          </div>
         </aside>
 
-        {/* centre: stage + log */}
         <div className="flex min-h-0 min-w-0 flex-col gap-2 p-3">
           <div className="min-h-0 flex-1">
             {scene ? (
-              <Stage
-                scene={scene}
-                selectedId={selectedId}
-                onSelect={setSelectedId}
-                onChange={updateLayer}
-                showOutlines={showOutlines}
-              />
+              <Stage scene={scene} selectedId={selectedId} onSelect={setSelectedId} onChange={updateLayer} showOutlines={showOutlines} />
             ) : (
               <div className="checker flex h-full items-center justify-center rounded-lg border border-ink-800">
                 <p className="max-w-sm px-6 text-center text-xs leading-relaxed text-ink-400">
-                  {running ? '正在跑管线，中间产物会实时出现在下面…' : '左边写提示词，选一条管线，点运行。'}
+                  {running ? '正在跑管线，中间产物会实时出现在下面…' : '左边写提示词，选一条管线点运行；或者直接一键评测，把所有方案跑一遍。'}
                 </p>
               </div>
             )}
           </div>
+
+          {metrics ? <MetricRow metrics={metrics} /> : null}
 
           <div className="scrollbar-thin max-h-56 shrink-0 overflow-y-auto rounded-lg border border-ink-800 bg-ink-900">
             <div className="grid grid-cols-1 divide-y divide-ink-800 xl:grid-cols-2 xl:divide-x xl:divide-y-0">
@@ -264,15 +413,11 @@ export default function Workbench() {
           </div>
         </div>
 
-        {/* right: layers + inspector */}
         <aside className="scrollbar-thin min-h-0 overflow-y-auto border-l border-ink-800">
           <Section
             title="图层"
             right={
-              <button
-                onClick={() => setShowOutlines((v) => !v)}
-                className="font-mono text-[9px] text-ink-400 hover:text-banana-400"
-              >
+              <button onClick={() => setShowOutlines((v) => !v)} className="font-mono text-[9px] text-ink-400 hover:text-banana-400">
                 {showOutlines ? '隐藏边框' : '显示边框'}
               </button>
             }

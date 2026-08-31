@@ -1,11 +1,11 @@
 'use client'
 
-import type { RunStep, UsageInfo } from '../types'
+import type { Artifact, RunStep, UsageInfo } from '../types'
 
 export type PipelineCtx = {
   signal?: AbortSignal
   onStep: (step: RunStep) => void
-  onArtifact: (artifact: { label: string; src: string }) => void
+  onArtifact: (artifact: Artifact) => void
   /** Mutated as the run proceeds so the UI can show a live cost counter. */
   totals: { cost: number; ms: number }
 }

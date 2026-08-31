@@ -12,7 +12,7 @@ import type {
   UsageInfo,
 } from '../types'
 import { boxToRect, checkCancelled, hexOr, mapLimit, skip, track, type PipelineCtx } from './shared'
-import { aspectToSize } from './compose'
+import { aspectToSize, segment } from './compose'
 
 const SEG_CONCURRENCY = 2
 
@@ -24,12 +24,14 @@ const SEG_CONCURRENCY = 2
  * masks, and the image model does the inpainting that a local LaMa would do.
  * Ceiling is roughly PSNR 26 — good enough to edit, never pixel-exact.
  */
+export type DecomposeResult = { scene: Scene; source: string }
+
 export async function runDecompose(
   ctx: PipelineCtx,
   input: { prompt: string; sourceImage?: string },
   opts: DecomposeOptions,
   models: { image: string; vision: string; grounding: string },
-): Promise<Scene> {
+): Promise<DecomposeResult> {
   let width: number
   let height: number
   let flat: string
@@ -41,7 +43,7 @@ export async function runDecompose(
     width = size.width
     height = size.height
     skip(ctx, 'flat', '来源图', `用户上传 · ${width}×${height}`)
-    ctx.onArtifact({ label: '来源平图', src: flat })
+    ctx.onArtifact({ label: '来源平图', src: flat, role: 'source' })
   } else {
     const planned = aspectToSize(opts.aspectRatio, opts.resolution)
     flat = await track(ctx, 'flat', '生成一张拍平的成品图', async () => {
@@ -58,7 +60,7 @@ export async function runDecompose(
       })
       const json = await res.json()
       if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-      ctx.onArtifact({ label: '来源平图', src: json.images[0] })
+      ctx.onArtifact({ label: '来源平图', src: json.images[0], role: 'source' })
       return { value: json.images[0] as string, usage: json.usage as UsageInfo }
     })
     const size = await imageSize(flat)
@@ -85,35 +87,40 @@ export async function runDecompose(
   })
 
   // 3 ── masks (or plain box crops if grounding declines)
-  let masks: Record<string, { box: [number, number, number, number]; mask: string | null }> = {}
+  //
+  // One request per object, run with a small concurrency cap. Batching every mask
+  // into one completion was measured at >170s before timing out: each mask is
+  // base64 text in the response stream, so they add up fast.
+  let masks: Record<string, { box: [number, number, number, number] | null; mask: string | null }> = {}
   if (opts.useMasks && analysis.elements.length) {
-    masks = await track(ctx, 'segment', '请求分割掩码', async () => {
-      const res = await fetch('/api/segment', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          image: flat,
-          labels: analysis.elements.map((e) => e.label),
-          model: opts.groundingModel || models.grounding,
-        }),
-        signal: ctx.signal,
-      })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-
+    masks = await track(ctx, 'segment', `请求分割掩码 ×${analysis.elements.length}`, async () => {
+      let cost = 0
+      const notes: string[] = []
       const out: typeof masks = {}
-      const list = json.masks as { label: string; box: [number, number, number, number]; mask: string | null }[]
-      analysis.elements.forEach((el, i) => {
-        const hit = list.find((m) => m.label === el.label) ?? list[i]
-        if (hit) out[el.id] = { box: hit.box, mask: hit.mask }
+
+      const results = await mapLimit(analysis.elements, SEG_CONCURRENCY, async (el) => {
+        try {
+          return { el, seg: await segment(ctx, flat, el.label, opts.groundingModel || models.grounding) }
+        } catch (err) {
+          if ((err as Error).name === 'Cancelled') throw err
+          return { el, seg: null }
+        }
       })
+
+      for (const { el, seg } of results) {
+        cost += seg?.usage?.cost ?? 0
+        if (seg?.mask) out[el.id] = { box: seg.box, mask: seg.mask }
+        else if (seg?.box) out[el.id] = { box: seg.box, mask: null }
+        if (seg?.reason && !notes.includes(seg.reason)) notes.push(seg.reason)
+      }
+
       const withMask = Object.values(out).filter((m) => m.mask).length
       return {
         value: out,
-        usage: json.usage as UsageInfo,
-        detail: json.degraded
-          ? `模型未返回掩码，降级为矩形裁切（${analysis.elements.length} 个）`
-          : `${withMask}/${analysis.elements.length} 个拿到掩码`,
+        usage: { cost },
+        detail: withMask
+          ? `${withMask}/${analysis.elements.length} 个拿到掩码${notes.length ? ` · ${notes.join('；')}` : ''}`
+          : `一个掩码都没拿到，全部降级为矩形裁切${notes.length ? ` · ${notes.join('；')}` : ''}`,
       }
     })
   } else {
@@ -125,11 +132,12 @@ export async function runDecompose(
     try {
       return await track(ctx, `cut-${el.id}`, `切图 ${i + 1}/${analysis.elements.length}：${el.label}`, async () => {
         const hit = masks[el.id]
-        const matte = hit?.mask
-          ? await maskMatte(flat, hit.mask, hit.box)
-          : await cropBox(flat, hit?.box ?? el.box)
+        // The grounding box is tighter than the layout box when it exists; fall
+        // back to what the layout pass reported otherwise.
+        const box = hit?.box ?? el.box
+        const matte = hit?.mask ? await maskMatte(flat, hit.mask, box) : await cropBox(flat, box)
 
-        ctx.onArtifact({ label: `${el.label} · 切出`, src: matte.src })
+        ctx.onArtifact({ label: `${el.label} · 切出`, src: matte.src, role: 'cut' })
 
         const layer: ImageLayer = {
           id: el.id,
@@ -177,7 +185,7 @@ export async function runDecompose(
       })
       const json = await res.json()
       if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-      ctx.onArtifact({ label: '重建的背景板', src: json.image })
+      ctx.onArtifact({ label: '重建的背景板', src: json.image, role: 'plate' })
       return { value: json.image as string, usage: json.usage as UsageInfo }
     })
   } else {
@@ -231,7 +239,10 @@ export async function runDecompose(
   const layers: Layer[] = [background, ...elements, ...textLayers]
 
   return {
-    canvas: { width, height, background: hexOr(analysis.background.dominantColor, '#111114') },
-    layers,
+    scene: {
+      canvas: { width, height, background: hexOr(analysis.background.dominantColor, '#111114') },
+      layers,
+    },
+    source: flat,
   }
 }

@@ -32,7 +32,7 @@ function headers() {
   return h
 }
 
-async function post(path: string, body: unknown, timeoutMs = 170_000) {
+async function post(path: string, body: unknown, timeoutMs = 55_000) {
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), timeoutMs)
   try {
@@ -78,6 +78,7 @@ export type ImageCall = {
   outputFormat?: 'png' | 'jpeg' | 'webp'
   /** data: URIs or https URLs */
   references?: string[]
+  timeoutMs?: number
 }
 
 export async function generateImages(call: ImageCall) {
@@ -98,7 +99,7 @@ export async function generateImages(call: ImageCall) {
     }))
   }
 
-  const json = await post('/images', body)
+  const json = await post('/images', body, call.timeoutMs)
   const data: any[] = json?.data ?? []
   const images = data
     .map((d) => {
@@ -131,6 +132,7 @@ export type ChatCall = {
   schema?: { name: string; schema: Record<string, unknown> }
   maxTokens?: number
   temperature?: number
+  timeoutMs?: number
 }
 
 export async function chat(call: ChatCall) {
@@ -156,7 +158,7 @@ export async function chat(call: ChatCall) {
     }
   }
 
-  const json = await post('/chat/completions', body)
+  const json = await post('/chat/completions', body, call.timeoutMs)
   const text: string = json?.choices?.[0]?.message?.content ?? ''
   return {
     text,
