@@ -13,6 +13,8 @@ import type {
 } from '../types'
 import { backgroundPrompt, elementPrompt } from '../prompts'
 import { api, boxToRect, checkCancelled, emit, hexOr, mapLimit, skip, track, tryTrack, type PipelineCtx } from './shared'
+import { describeRuns, recoverText } from './text'
+import { compositeMasked } from '../matte'
 
 type GenRes = { images: string[]; usage: UsageInfo; model: string }
 
@@ -315,7 +317,7 @@ export async function runCompose(
   })
 
   // 4 ── type
-  let textLayers: TextLayer[] = []
+  let textLayers: Layer[] = []
   let backgroundSrc = bgSrc
   const tailNodes = [plateNode, cutsNode]
 
@@ -324,7 +326,7 @@ export async function runCompose(
     textLayers = plan.texts.map((t) => planTextToLayer(t, width, height))
   } else {
     const ocrNode = `n:${B}:ocr`
-    const recovered = await track(
+    const analysed = await track(
       ctx,
       'ocr',
       'OCR 回收烘焙的文字',
@@ -338,17 +340,45 @@ export async function runCompose(
         })
         const a = json.analysis as SceneAnalysis
         return {
-          value: a.texts,
+          value: a,
           usage: json.usage as UsageInfo,
           detail: `识别出 ${a.texts.length} 段`,
-          summary: a.texts.map((t) => `「${t.content}」 ${t.fontFamily} ${t.fontWeight}`).join('\n') || '没识别出文字',
+          summary: a.texts.map((t) => `「${t.content}」`).join('\n') || '没识别出文字',
         }
       },
       { id: ocrNode, kind: 'analysis', inputs: [plateNode] },
     )
 
+    const textNode = `n:${B}:text`
+    const recovered = await track(
+      ctx,
+      'fit',
+      `字形贴合 ×${analysed.texts.length}`,
+      async () => {
+        const res = await recoverText(ctx, bgSrc, analysed.texts, { width, height }, {
+          fitGlyphs: true,
+          refineText: true,
+          // The baked arm exists to measure what re-setting type costs, so it
+          // always re-sets rather than keeping the original pixels.
+          textMode: 'vector',
+          visionModel: opts.visionModel,
+        })
+        return {
+          value: res,
+          usage: { cost: res.cost },
+          detail: res.notes.join(' · ') || `${res.texts.length} 段`,
+          summary: describeRuns(res.texts),
+        }
+      },
+      { id: textNode, kind: 'text', inputs: [ocrNode] },
+    )
+
+    const textRegions = recovered.texts
+      .map((t) => t.inkBox)
+      .filter((b): b is { x: number; y: number; w: number; h: number } => Boolean(b))
+
     const eraseNode = `n:${B}:erase`
-    backgroundSrc = await tryTrack(
+    const erased = await tryTrack(
       ctx,
       'erase',
       '擦除文字，重建背景',
@@ -360,20 +390,35 @@ export async function runCompose(
           resolution: opts.resolution,
           model: models.image,
         })
-        ctx.onArtifact({ label: '擦除后的背景板', src: json.image, role: 'plate' })
         return {
           value: json.image as string,
           usage: json.usage as UsageInfo,
-          images: [{ label: '擦除后的背景板', src: json.image }],
+          images: [{ label: '重绘底片', src: json.image }],
         }
       },
-      { id: eraseNode, kind: 'erase', inputs: [plateNode, ocrNode] },
-      { value: bgSrc, note: '重建被拒，背景层沿用原图（文字会重影）' },
+      { id: eraseNode, kind: 'erase', inputs: [plateNode, textNode] },
+      { value: null as unknown as string, note: '重建被拒，背景沿用原图（文字会重影）' },
     )
 
-    textLayers = recovered.map((t, i) => analysisTextToLayer(t, width, height, i))
+    // Patch only where the ink was: the erase regenerates the whole frame, and
+    // taking all of it would drift every untouched pixel of the plate.
+    backgroundSrc = erased ? await compositeMasked(bgSrc, erased, textRegions) : bgSrc
+    if (erased) {
+      ctx.onArtifact({ label: '擦除后的背景板', src: backgroundSrc, role: 'plate' })
+      emit(ctx, {
+        id: eraseNode,
+        kind: 'erase',
+        label: '擦除文字，重建背景',
+        detail: `只在 ${textRegions.length} 处文字区合成`,
+        inputs: [plateNode, textNode],
+        status: 'ok',
+        images: [{ label: '最终背景板', src: backgroundSrc }],
+      })
+    }
+
+    textLayers = recovered.texts.map((t) => t.layer)
     tailNodes[0] = eraseNode
-    tailNodes.push(ocrNode)
+    tailNodes.push(textNode)
   }
 
   const background: ImageLayer = {
@@ -478,30 +523,6 @@ function planTextToLayer(t: ScenePlan['texts'][number], width: number, height: n
     letterSpacing: 0,
     italic: false,
     provenance: '规划直出 · 从未进入像素',
-  }
-}
-
-function analysisTextToLayer(t: SceneAnalysis['texts'][number], width: number, height: number, i: number): TextLayer {
-  const rect = boxToRect(t.box, width, height)
-  return {
-    id: t.id || `ocr-${i}`,
-    type: 'text',
-    name: t.content.slice(0, 24) || '文字',
-    ...rect,
-    rotation: 0,
-    opacity: 1,
-    visible: true,
-    locked: false,
-    text: t.content,
-    fontFamily: t.fontFamily || 'Inter',
-    fontSize: clampFontSize(t.fontSize, rect.h),
-    fontWeight: t.fontWeight || 600,
-    color: hexOr(t.color, '#ffffff'),
-    align: t.align || 'left',
-    lineHeight: 1.15,
-    letterSpacing: 0,
-    italic: Boolean(t.italic),
-    provenance: 'OCR 回收 · 字体为模型猜测',
   }
 }
 

@@ -20,6 +20,18 @@ export type ImageLayer = LayerBase & {
   src: string
   /** Matting strategy that produced the alpha channel, if any. */
   matte?: MatteStrategy
+  /**
+   * Present when this layer is type kept as pixels rather than re-set in a web
+   * font. The original glyphs survive exactly — including lettering no font can
+   * reproduce — and editing the string means regenerating it in the same style
+   * rather than typing into a text node.
+   */
+  retype?: {
+    text: string
+    /** The original crop, handed back to the image model as a style reference. */
+    styleRef: string
+    color: string
+  }
 }
 
 export type TextLayer = LayerBase & {
@@ -68,6 +80,24 @@ export const MATTE_BACKDROP: Record<MatteStrategy, [number, number, number] | nu
   none: null,
 }
 
+/** What a recovered text run becomes in the scene. */
+export type TextMode =
+  | 'vector' // re-set in a web font: fully editable, the face is approximated
+  | 'pixel'  // the original glyphs cut out with alpha: exact, re-typed on demand
+
+export const TEXT_MODES: { id: TextMode; label: string; note: string }[] = [
+  {
+    id: 'vector',
+    label: '重排为真文本',
+    note: '用量出来的字号/位置/颜色，在 web 字体里重新排一遍。随便改字，但 AI 画的笔画还原不了。',
+  },
+  {
+    id: 'pixel',
+    label: '保留原始笔画',
+    note: '用量出来的掩码把原字直接抠成 RGBA 图层，像素级一致。改字时交给 Nano Banana 按原样式重绘。',
+  },
+]
+
 export type TextStrategy = 'live' | 'baked'
 
 export const TEXT_STRATEGIES: { id: TextStrategy; label: string; note: string }[] = [
@@ -96,6 +126,12 @@ export type DecomposeOptions = {
   useMasks: boolean
   /** Use the image model to inpaint the holes left behind by lifted elements. */
   inpaintBackground: boolean
+  /** Measure glyph pixels locally instead of trusting the model's box and size. */
+  fitGlyphs: boolean
+  /** Re-read each run from a zoomed crop for content, face and weight. */
+  refineText: boolean
+  /** How recovered type is put back. See TEXT_MODES. */
+  textMode: TextMode
   maxElements: number
 }
 
@@ -160,6 +196,7 @@ export type NodeKind =
   | 'analysis'  // layout read back off the pixels
   | 'renders'   // raw element renders, grouped
   | 'cuts'      // matted elements, grouped
+  | 'text'      // measured, fitted text layers
   | 'erase'     // reconstructed background
   | 'scene'     // the assembled, editable result
 

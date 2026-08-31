@@ -280,6 +280,80 @@ export async function thumbnail(src: string, size = 320): Promise<string> {
   return canvas.toDataURL('image/jpeg', 0.72)
 }
 
+/**
+ * Patch one image into another through a feathered rect mask.
+ *
+ * The erase call regenerates the whole frame, so its output drifts everywhere —
+ * colours shift, edges move, detail is reinvented. Taking the erased pixels only
+ * where something was actually lifted, and the original everywhere else, keeps
+ * the untouched parts of the plate bit-identical to what the model first drew.
+ */
+export async function compositeMasked(
+  baseSrc: string,
+  patchSrc: string,
+  regions: { x: number; y: number; w: number; h: number }[],
+  opts: { dilate?: number; feather?: number } = {},
+): Promise<string> {
+  if (!regions.length) return baseSrc
+
+  const dilate = opts.dilate ?? 6
+  const feather = opts.feather ?? 5
+
+  const base = await loadImage(baseSrc)
+  const W = base.naturalWidth
+  const H = base.naturalHeight
+
+  const patch = await loadImage(patchSrc)
+
+  // Mask: white where the patch should win, blurred so the seam is not visible.
+  const maskLayer = ctxOf(W, H)
+  maskLayer.ctx.filter = `blur(${feather}px)`
+  maskLayer.ctx.fillStyle = '#fff'
+  for (const r of regions) {
+    maskLayer.ctx.fillRect(r.x - dilate, r.y - dilate, r.w + dilate * 2, r.h + dilate * 2)
+  }
+  maskLayer.ctx.filter = 'none'
+
+  // Cut the patch down to the mask.
+  const patchLayer = ctxOf(W, H)
+  patchLayer.ctx.drawImage(patch, 0, 0, W, H)
+  patchLayer.ctx.globalCompositeOperation = 'destination-in'
+  patchLayer.ctx.drawImage(maskLayer.canvas, 0, 0)
+  patchLayer.ctx.globalCompositeOperation = 'source-over'
+
+  const out = ctxOf(W, H)
+  out.ctx.drawImage(base, 0, 0, W, H)
+  out.ctx.drawImage(patchLayer.canvas, 0, 0)
+  return out.canvas.toDataURL('image/png')
+}
+
+/** Crop a region and scale it up, so a vision model sees the glyphs large. */
+export async function cropAndZoom(
+  src: string,
+  box: { x: number; y: number; w: number; h: number },
+  opts: { pad?: number; minDim?: number; maxDim?: number } = {},
+): Promise<string> {
+  const pad = opts.pad ?? 0.25
+  const minDim = opts.minDim ?? 320
+  const maxDim = opts.maxDim ?? 768
+
+  const img = await loadImage(src)
+  const px = box.w * pad
+  const py = box.h * pad
+  const sx = Math.max(0, Math.round(box.x - px))
+  const sy = Math.max(0, Math.round(box.y - py))
+  const sw = Math.min(img.naturalWidth - sx, Math.round(box.w + px * 2))
+  const sh = Math.min(img.naturalHeight - sy, Math.round(box.h + py * 2))
+  if (sw < 2 || sh < 2) return src
+
+  const longest = Math.max(sw, sh)
+  const scale = Math.min(maxDim / longest, Math.max(1, minDim / longest))
+  const { canvas, ctx } = ctxOf(sw * scale, sh * scale)
+  ctx.imageSmoothingQuality = 'high'
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height)
+  return canvas.toDataURL('image/png')
+}
+
 export async function imageSize(src: string) {
   const img = await loadImage(src)
   return { width: img.naturalWidth, height: img.naturalHeight }

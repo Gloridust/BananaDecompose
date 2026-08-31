@@ -240,6 +240,69 @@ Output a JSON list containing exactly ONE entry, with:
 Keep the mask compact. Output only the JSON list, nothing else.`
 }
 
+// ------------------------------------------------------- refine a run
+
+export function refinePrompt(hint: string) {
+  return `This crop contains a single run of text, enlarged.
+
+${hint ? `A rough first read said it was: "${hint}". Correct it if that is wrong.\n\n` : ''}Report:
+- "content": the text EXACTLY as written — same characters, same case, same punctuation,
+  same language, same spacing. Nothing added, nothing translated, nothing normalised.
+- "fontFamily": the closest match among Inter, Georgia, Playfair Display, Space Grotesk,
+  Bebas Neue, Noto Sans SC, Noto Serif SC, system-ui. Judge by the letterforms —
+  serif vs sans, stroke contrast, terminal shapes, width. For Chinese, choose between
+  Noto Sans SC (no serifs) and Noto Serif SC (serifs / 宋体-like strokes).
+- "fontWeight": 100..900 in hundreds, judged by stroke thickness relative to height.
+- "italic": true only if the glyphs are genuinely slanted.
+- "isText": false if this crop turns out to hold no readable text at all.
+
+Do not report any coordinates or sizes — those are measured elsewhere.`
+}
+
+export const REFINE_SCHEMA = {
+  name: 'refined_run',
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['content', 'fontFamily', 'fontWeight', 'italic', 'isText'],
+    properties: {
+      content: { type: 'string' },
+      fontFamily: { type: 'string' },
+      fontWeight: { type: 'integer' },
+      italic: { type: 'boolean' },
+      isText: { type: 'boolean' },
+    },
+  },
+} as const
+
+// ------------------------------------------------------------- retype
+
+/**
+ * Redraw one run of type with different words but the same lettering.
+ *
+ * The reference image is a crop of the original run, so the model has the actual
+ * letterforms to copy rather than a description of them — which is the only way
+ * to keep hand-drawn or AI-invented type looking like itself after an edit.
+ */
+export function retypePrompt(text: string, backdrop: 'white' | 'black') {
+  const ground =
+    backdrop === 'white'
+      ? 'completely flat, uniform PURE WHITE (#FFFFFF)'
+      : 'completely flat, uniform PURE BLACK (#000000)'
+
+  return `Write exactly this text, and nothing else: ${text}
+
+Copy the lettering in the reference image precisely — the same typeface, the same stroke weights
+and stroke endings, the same proportions, the same slant, the same spacing rhythm, the same colour,
+the same texture and any wear or shading on the strokes. Someone who knows the original should read
+the result as the same hand, just different words.
+
+Set it on one line, horizontally, filling the frame with a small even margin.
+Place it on a ${ground} background that fills the entire frame edge to edge — perfectly uniform,
+no gradient, no vignette, no texture, no shadow, no glow, no outline, no box, no decoration.
+Nothing in the frame except the lettering itself.`
+}
+
 // -------------------------------------------------------------- erase
 
 export function erasePrompt(targets: string[]) {

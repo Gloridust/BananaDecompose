@@ -5,7 +5,8 @@ import Stage from './Stage'
 import { Inspector, LayerList, Section } from './Panels'
 import { MetricRow } from './Metrics'
 import { download, downloadJson, downloadSvg, sceneToPng } from '@/lib/export'
-import type { Layer, RunMetrics, Scene } from '@/lib/types'
+import { retypeLayer } from '@/lib/retype'
+import type { ImageLayer, Layer, RunMetrics, Scene } from '@/lib/types'
 
 /**
  * The layer editor, opened from a scene node on the board. Editing stays the
@@ -57,6 +58,23 @@ export default function SceneEditor({
 
   const selected = useMemo(() => scene.layers.find((l) => l.id === selectedId) ?? null, [scene, selectedId])
 
+  const handleRetype = useCallback(
+    async (layer: ImageLayer, text: string) => {
+      const next = await retypeLayer(layer, text)
+      updateLayer(layer.id, {
+        src: next.src,
+        x: next.x,
+        y: next.y,
+        w: next.w,
+        h: next.h,
+        name: text.slice(0, 24),
+        retype: { ...layer.retype!, text },
+        provenance: `原始笔画 · 已按原样式重绘为「${text}」`,
+      } as Partial<Layer>)
+    },
+    [updateLayer],
+  )
+
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-ink-950/95 backdrop-blur-sm">
       <header className="flex shrink-0 items-center gap-3 border-b border-ink-800 px-4 py-2.5">
@@ -96,7 +114,11 @@ export default function SceneEditor({
             />
           </Section>
           <Section title="属性">
-            <Inspector layer={selected} onChange={(patch) => selectedId && updateLayer(selectedId, patch)} />
+            <Inspector
+              layer={selected}
+              onChange={(patch) => selectedId && updateLayer(selectedId, patch)}
+              onRetype={handleRetype}
+            />
           </Section>
           <Section title="导出">
             <div className="grid grid-cols-3 gap-1.5">

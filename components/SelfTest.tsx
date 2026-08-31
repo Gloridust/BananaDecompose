@@ -4,6 +4,7 @@ import Link from 'next/link'
 import { useCallback, useEffect, useState } from 'react'
 import { chromaKeyMatte, dualRenderMatte, loadImage } from '@/lib/matte'
 import BoardCanvas from './Board'
+import GlyphTest from './GlyphTest'
 import type { Board } from '@/lib/types'
 
 // The matting maths is the load-bearing part of pipeline A, and it is the part
@@ -194,6 +195,8 @@ export default function SelfTest() {
         把它按渲染器的方式合成到白 / 黑 / 品红底上，再跑一遍恢复算法，和真值逐像素比。
         <strong className="text-ink-200"> 这是算法上限</strong>：真实模型两次生成不会像这里一样像素级一致，实际误差会更大。
       </p>
+
+      <GlyphTest />
 
       {demoBoard ? (
         <section className="mb-6">

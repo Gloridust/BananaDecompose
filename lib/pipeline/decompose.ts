@@ -1,16 +1,9 @@
 'use client'
 
-import { cropBox, imageSize, maskMatte } from '../matte'
+import { compositeMasked, imageSize, maskMatte } from '../matte'
 import { flatPrompt } from '../prompts'
-import type {
-  DecomposeOptions,
-  ImageLayer,
-  Layer,
-  Scene,
-  SceneAnalysis,
-  TextLayer,
-  UsageInfo,
-} from '../types'
+import { describeRuns, recoverText } from './text'
+import type { DecomposeOptions, ImageLayer, Layer, Scene, SceneAnalysis, UsageInfo } from '../types'
 import { api, boxToRect, checkCancelled, emit, hexOr, mapLimit, skip, track, tryTrack, type PipelineCtx } from './shared'
 import { PROMPT_NODE, aspectToSize, segment } from './compose'
 
@@ -141,11 +134,36 @@ export async function runDecompose(
     { id: analyzeNode, kind: 'analysis', inputs: [SOURCE_NODE] },
   )
 
-  // 3 ── masks (or plain box crops if grounding declines)
-  //
-  // One request per object, run with a small concurrency cap. Batching every mask
-  // into one completion was measured at >170s before timing out: each mask is
-  // base64 text in the response stream, so they add up fast.
+  // 3 ── type. Measured before anything is erased, because the ink has to be
+  // read off the pixels that still contain it.
+  const textNode = `n:${B}:text`
+  const recovered = await track(
+    ctx,
+    'text',
+    `回收文字 ×${analysis.texts.length}`,
+    async () => {
+      const res = await recoverText(ctx, flat, analysis.texts, { width, height }, {
+        fitGlyphs: opts.fitGlyphs,
+        refineText: opts.refineText,
+        textMode: opts.textMode,
+        visionModel: opts.visionModel,
+      })
+      return {
+        value: res,
+        usage: { cost: res.cost },
+        detail: res.notes.join(' · ') || `${res.texts.length} 段`,
+        summary: describeRuns(res.texts),
+      }
+    },
+    { id: textNode, kind: 'text', inputs: [analyzeNode] },
+  )
+
+  const textRegions = recovered.texts
+    .map((t) => t.inkBox)
+    .filter((b): b is { x: number; y: number; w: number; h: number } => Boolean(b))
+
+  // 4 ── masks. One request per object: masks come back as base64 text, so
+  // batching them was measured at >170s before timing out.
   let masks: Record<string, { box: [number, number, number, number] | null; mask: string | null }> = {}
   if (opts.useMasks && analysis.elements.length) {
     masks = await track(ctx, 'segment', `请求分割掩码 ×${analysis.elements.length}`, async () => {
@@ -165,60 +183,118 @@ export async function runDecompose(
       for (const { el, seg } of results) {
         cost += seg?.usage?.cost ?? 0
         if (seg?.mask) out[el.id] = { box: seg.box, mask: seg.mask }
-        else if (seg?.box) out[el.id] = { box: seg.box, mask: null }
         if (seg?.reason && !notes.includes(seg.reason)) notes.push(seg.reason)
       }
 
-      const withMask = Object.values(out).filter((m) => m.mask).length
+      const withMask = Object.keys(out).length
       return {
         value: out,
         usage: { cost },
         detail: withMask
           ? `${withMask}/${analysis.elements.length} 个拿到掩码${notes.length ? ` · ${notes.join('；')}` : ''}`
-          : `一个掩码都没拿到，全部降级为矩形裁切${notes.length ? ` · ${notes.join('；')}` : ''}`,
+          : `一个掩码都没拿到${notes.length ? ` · ${notes.join('；')}` : ''}`,
       }
     })
   } else {
-    skip(ctx, 'segment', '分割掩码', '已关闭，元素按 bbox 矩形裁切')
+    skip(ctx, 'segment', '分割掩码', '已关闭，元素留在背景里，不生成独立图层')
   }
+
+  const masked = analysis.elements.filter((el) => masks[el.id]?.mask)
   emit(ctx, {
     id: `n:${B}:segment`,
     kind: 'renders',
     label: opts.useMasks ? `分割掩码 ×${analysis.elements.length}` : '分割掩码（已关闭）',
     detail: opts.useMasks
-      ? `${Object.values(masks).filter((m) => m.mask).length}/${analysis.elements.length} 个拿到掩码`
-      : '元素退化为 bbox 矩形裁切',
+      ? `${masked.length}/${analysis.elements.length} 个可切出独立图层`
+      : '元素留在背景里 —— 没有掩码就没有可编辑元素',
     inputs: [analyzeNode],
     status: opts.useMasks ? 'ok' : 'skipped',
   })
 
-  // 4 ── lift each element out of the flat raster
+  // 5 ── reconstruct. The erase regenerates the whole frame, so its output is
+  // only trusted where something was actually lifted; everywhere else the
+  // original pixels are kept and the plate stays faithful.
+  const plateNode = `n:${B}:erase`
+  const elementRegions = masked.map((el) => boxToRect(masks[el.id]!.box ?? el.box, width, height))
+
+  let erased: string | null = null
+  if (opts.inpaintBackground && (textRegions.length || elementRegions.length)) {
+    erased = await tryTrack(
+      ctx,
+      'inpaint',
+      '擦除文字与元素，重建背景',
+      async () => {
+        const json = await api<any>('/api/erase', ctx, {
+          image: flat,
+          targets: masked.map((e) => e.label),
+          aspectRatio: opts.aspectRatio,
+          resolution: opts.resolution,
+          model: models.image,
+        })
+        ctx.onArtifact({ label: '重绘底片', src: json.image, role: 'plate' })
+        return {
+          value: json.image as string,
+          usage: json.usage as UsageInfo,
+          images: [{ label: '重绘底片', src: json.image }],
+        }
+      },
+      { id: plateNode, kind: 'erase', inputs: [SOURCE_NODE, textNode] },
+      { value: null as unknown as string, note: '重建被拒，背景沿用原图（文字会重影）' },
+    )
+  } else {
+    skip(
+      ctx,
+      'inpaint',
+      '背景重建',
+      '已关闭，背景层保留原图（文字与元素会重影）',
+      { id: plateNode, kind: 'erase', inputs: [SOURCE_NODE, textNode] },
+    )
+  }
+
+  // Text goes first: elements are then cut from an image that no longer carries
+  // baked type, so a lifted element cannot drag the old lettering back on top of
+  // the clean plate — which is exactly how the ghosting used to appear.
+  const textFree = erased ? await compositeMasked(flat, erased, textRegions) : flat
+  const plate = erased ? await compositeMasked(textFree, erased, elementRegions) : flat
+
+  if (erased) {
+    emit(ctx, {
+      id: plateNode,
+      kind: 'erase',
+      label: '擦除文字与元素，重建背景',
+      detail: `只在 ${textRegions.length} 处文字 + ${elementRegions.length} 处元素合成，其余像素与原图一致`,
+      inputs: [SOURCE_NODE, textNode],
+      status: 'ok',
+      images: [{ label: '最终背景板', src: plate }],
+    })
+    ctx.onArtifact({ label: '最终背景板', src: plate, role: 'plate' })
+  }
+
+  // 6 ── lift each masked element out of the text-free raster
   const cutsNode = `n:${B}:cuts`
   const cutShots: { label: string; src: string }[] = []
   emit(ctx, {
     id: cutsNode,
     kind: 'cuts',
-    label: `切图 ×${analysis.elements.length}`,
-    inputs: [`n:${B}:segment`],
-    status: 'running',
+    label: `切图 ×${masked.length}`,
+    inputs: [`n:${B}:segment`, plateNode],
+    status: masked.length ? 'running' : 'skipped',
+    detail: masked.length ? undefined : '没有掩码，不切图',
   })
 
-  const elementLayers = await mapLimit(analysis.elements, SEG_CONCURRENCY, async (el, i) => {
+  const elementLayers = await mapLimit(masked, SEG_CONCURRENCY, async (el, i) => {
     try {
-      return await track(ctx, `cut-${el.id}`, `切图 ${i + 1}/${analysis.elements.length}：${el.label}`, async () => {
-        const hit = masks[el.id]
-        // The grounding box is tighter than the layout box when it exists; fall
-        // back to what the layout pass reported otherwise.
-        const box = hit?.box ?? el.box
-        const matte = hit?.mask ? await maskMatte(flat, hit.mask, box) : await cropBox(flat, box)
+      return await track(ctx, `cut-${el.id}`, `切图 ${i + 1}/${masked.length}：${el.label}`, async () => {
+        const hit = masks[el.id]!
+        const matte = await maskMatte(textFree, hit.mask, hit.box ?? el.box)
 
         ctx.onArtifact({ label: `${el.label} · 切出`, src: matte.src, role: 'cut' })
         cutShots.push({ label: el.label, src: matte.src })
         emit(ctx, {
           id: cutsNode,
           kind: 'cuts',
-          label: `切图 ×${analysis.elements.length}`,
-          inputs: [`n:${B}:segment`],
+          label: `切图 ×${masked.length}`,
+          inputs: [`n:${B}:segment`, plateNode],
           status: 'running',
           images: [...cutShots],
         })
@@ -236,12 +312,10 @@ export async function runDecompose(
           visible: true,
           locked: false,
           src: matte.src,
-          matte: hit?.mask ? 'vlm-mask' : 'none',
-          provenance: hit?.mask
-            ? `分割掩码切出 · 覆盖率 ${(matte.coverage * 100).toFixed(0)}%`
-            : 'bbox 矩形裁切 · 无 alpha',
+          matte: 'vlm-mask',
+          provenance: `分割掩码切出 · 覆盖率 ${(matte.coverage * 100).toFixed(0)}% · 已去除烘焙文字`,
         }
-        return { value: layer, detail: hit?.mask ? '掩码' : '矩形' }
+        return { value: layer, detail: `覆盖率 ${(matte.coverage * 100).toFixed(0)}%` }
       })
     } catch (err) {
       if ((err as Error).name === 'Cancelled') throw err
@@ -254,50 +328,14 @@ export async function runDecompose(
   emit(ctx, {
     id: cutsNode,
     kind: 'cuts',
-    label: `切图 ×${analysis.elements.length}`,
-    detail: Object.values(masks).some((m) => m.mask) ? '掩码切出' : 'bbox 矩形裁切，无 alpha',
-    inputs: [`n:${B}:segment`],
-    status: 'ok',
+    label: `切图 ×${masked.length}`,
+    detail: masked.length ? '掩码切出，已去除烘焙文字' : '没有掩码，元素留在背景里',
+    inputs: [`n:${B}:segment`, plateNode],
+    status: masked.length ? 'ok' : 'skipped',
     images: [...cutShots],
   })
 
-  // 5 ── reconstruct what was underneath
-  const plateNode = `n:${B}:erase`
-  let plate = flat
-  if (opts.inpaintBackground) {
-    plate = await tryTrack(
-      ctx,
-      'inpaint',
-      '擦除元素与文字，重建背景板',
-      async () => {
-        const json = await api<any>('/api/erase', ctx, {
-          image: flat,
-          targets: analysis.elements.map((e) => e.label),
-          aspectRatio: opts.aspectRatio,
-          resolution: opts.resolution,
-          model: models.image,
-        })
-        ctx.onArtifact({ label: '重建的背景板', src: json.image, role: 'plate' })
-        return {
-          value: json.image as string,
-          usage: json.usage as UsageInfo,
-          images: [{ label: '重建的背景板', src: json.image }],
-        }
-      },
-      { id: plateNode, kind: 'erase', inputs: [SOURCE_NODE, analyzeNode] },
-      { value: flat, note: '重建被拒，背景层沿用原图（元素会重影）' },
-    )
-  } else {
-    skip(
-      ctx,
-      'inpaint',
-      '背景重建',
-      '已关闭，背景层仍是原始平图（元素会重影）',
-      { id: plateNode, kind: 'erase', inputs: [SOURCE_NODE] },
-    )
-  }
-
-  // 6 ── assemble
+  // 7 ── assemble
   const background: ImageLayer = {
     id: 'background',
     type: 'image',
@@ -312,36 +350,11 @@ export async function runDecompose(
     locked: false,
     src: plate,
     matte: 'none',
-    provenance: opts.inpaintBackground ? '模型重绘补全' : '原始平图（未重建）',
+    provenance: erased ? '按区域合成：只在文字与元素处采用重绘' : '原始平图（未重建）',
   }
 
-  const textLayers: TextLayer[] = analysis.texts.map((t, i) => {
-    const rect = boxToRect(t.box, width, height)
-    const size = Number(t.fontSize)
-    return {
-      id: t.id || `tx-${i}`,
-      type: 'text',
-      name: t.content.slice(0, 24) || '文字',
-      ...rect,
-      rotation: 0,
-      opacity: 1,
-      visible: true,
-      locked: false,
-      text: t.content,
-      fontFamily: t.fontFamily || 'Inter',
-      fontSize: Number.isFinite(size) && size > 0 ? Math.min(size, rect.h * 1.6) : Math.max(12, rect.h * 0.78),
-      fontWeight: t.fontWeight || 600,
-      color: hexOr(t.color, '#ffffff'),
-      align: t.align || 'left',
-      lineHeight: 1.15,
-      letterSpacing: 0,
-      italic: Boolean(t.italic),
-      provenance: 'OCR 回收 · 内容与字体均为模型推断',
-    }
-  })
-
   const elements = elementLayers.filter((l): l is ImageLayer => Boolean(l))
-  const layers: Layer[] = [background, ...elements, ...textLayers]
+  const layers: Layer[] = [background, ...elements, ...recovered.texts.map((t) => t.layer)]
 
   return {
     scene: {
@@ -349,6 +362,6 @@ export async function runDecompose(
       layers,
     },
     source: flat,
-    tailNodes: [plateNode, cutsNode],
+    tailNodes: [plateNode, ...(masked.length ? [cutsNode] : []), textNode],
   }
 }

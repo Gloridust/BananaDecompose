@@ -65,17 +65,31 @@ export default function BoardCanvas({
   useEffect(() => {
     const host = hostRef.current
     if (!host) return
+
     const onWheel = (e: WheelEvent) => {
       e.preventDefault()
+
+      // Trackpad convention, the same one Figma and tldraw use: a two-finger
+      // drag arrives as a plain wheel event and pans, while a pinch arrives with
+      // ctrlKey synthesised by the browser and zooms. Cmd+wheel zooms too, for
+      // anyone on a mouse.
+      if (!e.ctrlKey && !e.metaKey) {
+        setView((v) => ({ ...v, x: v.x - e.deltaX, y: v.y - e.deltaY }))
+        return
+      }
+
       const rect = host.getBoundingClientRect()
       const px = e.clientX - rect.left
       const py = e.clientY - rect.top
+      // Pinch deltas are far coarser than a wheel notch, so they need a gentler factor.
+      const factor = e.ctrlKey ? 0.01 : 0.0016
       setView((v) => {
-        const k = Math.min(2.5, Math.max(0.12, v.k * Math.exp(-e.deltaY * 0.0016)))
+        const k = Math.min(2.5, Math.max(0.08, v.k * Math.exp(-e.deltaY * factor)))
         // Keep the point under the cursor fixed while zooming.
         return { k, x: px - ((px - v.x) / v.k) * k, y: py - ((py - v.y) / v.k) * k }
       })
     }
+
     host.addEventListener('wheel', onWheel, { passive: false })
     return () => host.removeEventListener('wheel', onWheel)
   }, [])
@@ -85,9 +99,16 @@ export default function BoardCanvas({
     const move = (e: PointerEvent) =>
       setView((v) => ({ ...v, x: panning.vx + (e.clientX - panning.x), y: panning.vy + (e.clientY - panning.y) }))
     const up = () => setPanning(null)
+
+    // A drag across cards would otherwise start a text selection, which both
+    // looks broken and steals the subsequent pointer events.
+    const prevSelect = document.body.style.userSelect
+    document.body.style.userSelect = 'none'
+
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up)
     return () => {
+      document.body.style.userSelect = prevSelect
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', up)
     }
@@ -118,10 +139,16 @@ export default function BoardCanvas({
         backgroundSize: `${24 * view.k}px ${24 * view.k}px`,
         backgroundPosition: `${view.x}px ${view.y}px`,
         cursor: panning ? 'grabbing' : 'grab',
+        // Let the wheel handler own every gesture; the browser's own pan/zoom
+        // would fight it on a trackpad.
+        touchAction: 'none',
+        overscrollBehavior: 'contain',
       }}
       onPointerDown={(e) => {
-        if (e.target !== e.currentTarget) return
-        onSelectNode(null)
+        // Middle-drag pans from anywhere, the way it does in every canvas tool.
+        const fromBackground = e.target === e.currentTarget
+        if (!fromBackground && e.button !== 1) return
+        if (fromBackground) onSelectNode(null)
         setPanning({ x: e.clientX, y: e.clientY, vx: view.x, vy: view.y })
       }}
     >
@@ -171,7 +198,11 @@ export default function BoardCanvas({
         </div>
       ) : null}
 
-      <div className="absolute bottom-2 right-2 flex items-center gap-1">
+      <div className="pointer-events-none absolute bottom-2 left-2 select-none font-mono text-[9px] leading-relaxed text-ink-700">
+        双指拖动平移 · 双指捏合或 ⌘+滚轮缩放 · 拖空白处也可平移
+      </div>
+
+      <div className="absolute bottom-2 right-2 flex select-none items-center gap-1">
         <button onClick={fit} className="rounded border border-ink-700 bg-ink-900/90 px-2 py-1 font-mono text-[10px] text-ink-400 hover:text-banana-400">
           适应画布
         </button>
@@ -224,7 +255,7 @@ function NodeCard({
         e.stopPropagation()
         onSelect()
       }}
-      className={`absolute overflow-hidden rounded-lg border bg-ink-900 transition-opacity ${
+      className={`absolute select-none overflow-hidden rounded-lg border bg-ink-900 transition-opacity ${
         selected ? 'border-banana-400 ring-1 ring-banana-400/40' : STATUS_RING[node.status]
       } ${dimmed ? 'opacity-45' : 'opacity-100'}`}
       style={{ left: x, top: y, width: w, height: h }}

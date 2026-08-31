@@ -1,6 +1,7 @@
 'use client'
 
-import type { Layer, RunStep, Scene, TextLayer } from '@/lib/types'
+import { useState } from 'react'
+import type { ImageLayer, Layer, RunStep, Scene, TextLayer } from '@/lib/types'
 import { fontStack } from '@/lib/export'
 
 export const FONT_CHOICES = [
@@ -110,7 +111,15 @@ function IconBtn({ children, label, onClick }: { children: React.ReactNode; labe
 
 // ------------------------------------------------------------- inspector
 
-export function Inspector({ layer, onChange }: { layer: Layer | null; onChange: (patch: Partial<Layer>) => void }) {
+export function Inspector({
+  layer,
+  onChange,
+  onRetype,
+}: {
+  layer: Layer | null
+  onChange: (patch: Partial<Layer>) => void
+  onRetype?: (layer: ImageLayer, text: string) => Promise<void>
+}) {
   if (!layer) {
     return <p className="px-1 py-2 text-xs text-ink-400">选中一个图层查看属性。双击文字图层可直接在画布上改字。</p>
   }
@@ -136,6 +145,54 @@ export function Inspector({ layer, onChange }: { layer: Layer | null; onChange: 
       </div>
 
       {layer.type === 'text' ? <TextControls layer={layer} onChange={onChange} /> : null}
+      {layer.type === 'image' && layer.retype && onRetype ? <RetypeControls layer={layer} onRetype={onRetype} /> : null}
+    </div>
+  )
+}
+
+/** Type kept as pixels cannot be edited in place — changing the words means
+ *  redrawing them, so the control is a regenerate button rather than a caret. */
+function RetypeControls({
+  layer,
+  onRetype,
+}: {
+  layer: ImageLayer
+  onRetype: (layer: ImageLayer, text: string) => Promise<void>
+}) {
+  const [draft, setDraft] = useState(layer.retype!.text)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const dirty = draft.trim() !== layer.retype!.text && draft.trim().length > 0
+
+  return (
+    <div className="space-y-2 border-t border-ink-800 pt-3">
+      <p className="text-[10px] leading-snug text-ink-400">
+        这层是<span className="text-ink-200">原始笔画</span>，不是文本节点。改字要按原样式重绘一版（2 次出图调用）。
+      </p>
+      <textarea
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        rows={2}
+        className="w-full resize-y rounded border border-ink-700 bg-ink-900 px-2 py-1.5 text-xs outline-none focus:border-banana-500"
+      />
+      <button
+        disabled={!dirty || busy}
+        onClick={async () => {
+          setBusy(true)
+          setError(null)
+          try {
+            await onRetype(layer, draft.trim())
+          } catch (err) {
+            setError((err as Error).message)
+          } finally {
+            setBusy(false)
+          }
+        }}
+        className="w-full rounded border border-banana-500 bg-banana-500/15 px-2 py-1.5 text-[11px] text-banana-400 transition hover:bg-banana-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        {busy ? '重绘中…' : dirty ? '按原样式重绘' : '改了字才能重绘'}
+      </button>
+      {error ? <p className="text-[10px] leading-snug text-rose-400">{error}</p> : null}
     </div>
   )
 }

@@ -18,6 +18,7 @@ export const NODE_H: Record<NodeKind, number> = {
   analysis: 168,
   renders: 176,
   cuts: 176,
+  text: 176,
   erase: 194,
   scene: 250,
 }
@@ -30,6 +31,7 @@ export const KIND_LABEL: Record<NodeKind, string> = {
   analysis: '读版面',
   renders: '渲染',
   cuts: '抠图',
+  text: '字形贴合',
   erase: '重绘',
   scene: '成品场景',
 }
@@ -43,6 +45,7 @@ export const KIND_COLOR: Record<NodeKind, string> = {
   analysis: '#8b7cf6',
   renders: '#f5b91c',
   cuts: '#34d399',
+  text: '#22d3ee',
   erase: '#fb7185',
   scene: '#ffd24a',
 }

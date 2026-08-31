@@ -1,6 +1,6 @@
 'use client'
 
-import { MATTE_STRATEGIES, TEXT_STRATEGIES } from '@/lib/types'
+import { MATTE_STRATEGIES, TEXT_MODES, TEXT_STRATEGIES } from '@/lib/types'
 import type { ComposeOptions, DecomposeOptions, PipelineId } from '@/lib/types'
 
 export const ASPECTS = ['1:1', '4:5', '3:2', '16:9', '9:16']
@@ -20,7 +20,7 @@ export const DEFAULT_SETTINGS: Settings = {
   concurrency: 4,
   prompt: '一张咖啡品鉴会的海报：暖褐色纸质背景，一只手冲壶、一个陶瓷杯、几颗散落的咖啡豆，标题「晨间萃取」，副标题「周六 9:00 · 三号仓库」',
   compose: { matte: 'dual', text: 'live', aspectRatio: '4:5', resolution: '1K', maxElements: 4, visionModel: '' },
-  decompose: { aspectRatio: '4:5', resolution: '1K', useMasks: true, inpaintBackground: true, maxElements: 6, groundingModel: '', visionModel: '' },
+  decompose: { aspectRatio: '4:5', resolution: '1K', useMasks: true, inpaintBackground: true, fitGlyphs: true, refineText: true, textMode: 'pixel', maxElements: 6, groundingModel: '', visionModel: '' },
 }
 
 const PIPELINES: { id: PipelineId; label: string; blurb: string }[] = [
@@ -241,8 +241,37 @@ function DecomposeControls({
         checked={opts.inpaintBackground}
         onChange={(v) => onChange({ inpaintBackground: v })}
         label="重绘补全背景"
-        note="把元素抬走后留下的洞交给 Nano Banana 补。关掉则背景层保留原图，元素会重影。"
+        note="把文字和元素抬走后留下的洞交给 Nano Banana 补。只在这些区域合成，其余像素与原图完全一致。"
       />
+      <Toggle
+        checked={opts.fitGlyphs}
+        onChange={(v) => onChange({ fitGlyphs: v })}
+        label="本地字形贴合"
+        note="在原图上用阈值分离出真正的字形像素，量出位置/字号/颜色，再解算字号与字距去对齐。关掉就只用模型给的框和字号 —— 这是文字对不准的主因。"
+      />
+      <Toggle
+        checked={opts.refineText}
+        onChange={(v) => onChange({ refineText: v })}
+        label="裁图回传复核"
+        note="把每段文字裁出来放大再送回视觉模型，重新确认内容和字体。几何不问它 —— 那是量出来的。每段一次便宜调用。"
+      />
+
+      <Field label="文字放回方式">
+        <div className="space-y-1">
+          {TEXT_MODES.map((m) => (
+            <button
+              key={m.id}
+              onClick={() => onChange({ textMode: m.id })}
+              className={`block w-full rounded border px-2 py-1.5 text-left transition ${
+                opts.textMode === m.id ? 'border-banana-500 bg-banana-500/10' : 'border-ink-800 hover:border-ink-600'
+              }`}
+            >
+              <span className={`text-xs ${opts.textMode === m.id ? 'text-banana-400' : 'text-ink-200'}`}>{m.label}</span>
+              <span className="mt-0.5 block text-[10px] leading-snug text-ink-400">{m.note}</span>
+            </button>
+          ))}
+        </div>
+      </Field>
 
       <SharedControls
         aspectRatio={opts.aspectRatio}
