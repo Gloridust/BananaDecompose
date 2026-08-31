@@ -134,3 +134,13 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# env
+.env
+.env.local
+.env*.local
+
+# next
+.next/
+out/
+next-env.d.ts

@@ -1,0 +1,295 @@
+'use client'
+
+// Every alpha recovery strategy runs in the browser on a <canvas>. Nothing here
+// touches the server: it keeps the serverless functions cheap and stateless, and
+// it means the pixel maths is inspectable in devtools while comparing strategies.
+
+export function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.crossOrigin = 'anonymous'
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error('Failed to decode image'))
+    img.src = src
+  })
+}
+
+function ctxOf(w: number, h: number) {
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(w))
+  canvas.height = Math.max(1, Math.round(h))
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })
+  if (!ctx) throw new Error('Canvas 2D context unavailable')
+  return { canvas, ctx }
+}
+
+async function dataOf(src: string, w?: number, h?: number) {
+  const img = await loadImage(src)
+  const width = w ?? img.naturalWidth
+  const height = h ?? img.naturalHeight
+  const { ctx } = ctxOf(width, height)
+  ctx.drawImage(img, 0, 0, width, height)
+  return ctx.getImageData(0, 0, width, height)
+}
+
+function toDataUrl(data: ImageData) {
+  const { canvas, ctx } = ctxOf(data.width, data.height)
+  ctx.putImageData(data, 0, 0)
+  return canvas.toDataURL('image/png')
+}
+
+// ------------------------------------------------------- dual render
+
+export type MatteResult = {
+  /** RGBA PNG data URI, trimmed to the subject's bounds. */
+  src: string
+  /** Subject bounds inside the source frame, normalised 0..1. */
+  bounds: { x: number; y: number; w: number; h: number }
+  /** Fraction of pixels with meaningful alpha — a cheap quality signal. */
+  coverage: number
+}
+
+/**
+ * Solve for alpha from two renders of the same subject over known backdrops.
+ *
+ *   over white:  Cw = F + (1 - a)
+ *   over black:  Cb = F
+ *   =>           a  = 1 - (Cw - Cb)      and      colour = Cb / a
+ *
+ * F is premultiplied, so black gives the premultiplied colour directly. The two
+ * renders are never bit-identical (the model is not deterministic), so per-channel
+ * alphas get averaged and the extremes are snapped.
+ */
+export async function dualRenderMatte(
+  whiteSrc: string,
+  blackSrc: string,
+  opts: { floor?: number; ceiling?: number } = {},
+): Promise<MatteResult> {
+  const floor = opts.floor ?? 0.06
+  const ceiling = opts.ceiling ?? 0.94
+
+  const white = await dataOf(whiteSrc)
+  const black = await dataOf(blackSrc, white.width, white.height)
+
+  const out = new ImageData(white.width, white.height)
+  const W = white.data
+  const B = black.data
+  const O = out.data
+
+  for (let i = 0; i < W.length; i += 4) {
+    const ar = 1 - (W[i] - B[i]) / 255
+    const ag = 1 - (W[i + 1] - B[i + 1]) / 255
+    const ab = 1 - (W[i + 2] - B[i + 2]) / 255
+
+    let a = (ar + ag + ab) / 3
+    if (a < floor) a = 0
+    else if (a > ceiling) a = 1
+    else a = Math.min(1, Math.max(0, a))
+
+    if (a === 0) {
+      O[i] = O[i + 1] = O[i + 2] = O[i + 3] = 0
+      continue
+    }
+    // Un-premultiply. Averaging the two renders cancels a little of the drift
+    // between them where the subject is fully opaque.
+    const inv = 1 / a
+    O[i] = Math.min(255, B[i] * inv)
+    O[i + 1] = Math.min(255, B[i + 1] * inv)
+    O[i + 2] = Math.min(255, B[i + 2] * inv)
+    O[i + 3] = Math.round(a * 255)
+  }
+
+  return trim(out)
+}
+
+// -------------------------------------------------------- chroma key
+
+/** Distance-based key with spill suppression. Default key is pure magenta. */
+export async function chromaKeyMatte(
+  src: string,
+  opts: { key?: [number, number, number]; near?: number; far?: number } = {},
+): Promise<MatteResult> {
+  const [kr, kg, kb] = opts.key ?? [255, 0, 255]
+  const near = opts.near ?? 90 // fully keyed at or below this distance
+  const far = opts.far ?? 180 // fully opaque at or above this distance
+
+  const data = await dataOf(src)
+  const D = data.data
+
+  for (let i = 0; i < D.length; i += 4) {
+    const dr = D[i] - kr
+    const dg = D[i + 1] - kg
+    const db = D[i + 2] - kb
+    const dist = Math.sqrt(dr * dr + dg * dg + db * db)
+
+    let a = (dist - near) / (far - near)
+    a = Math.min(1, Math.max(0, a))
+
+    if (a === 0) {
+      D[i] = D[i + 1] = D[i + 2] = D[i + 3] = 0
+      continue
+    }
+    // Despill: on a magenta key the giveaway is red+blue running ahead of green.
+    if (a < 1) {
+      const g = D[i + 1]
+      const cap = g + (255 - g) * a
+      if (kr > kg) D[i] = Math.min(D[i], cap)
+      if (kb > kg) D[i + 2] = Math.min(D[i + 2], cap)
+    }
+    D[i + 3] = Math.round(a * 255)
+  }
+
+  return trim(data)
+}
+
+// --------------------------------------------------------- VLM masks
+
+/**
+ * Apply a model-produced probability mask. The mask is box-local: it covers only
+ * the object's box_2d crop, so it gets stretched to that crop before use.
+ */
+export async function maskMatte(
+  src: string,
+  maskBase64: string | null,
+  box: [number, number, number, number],
+  opts: { threshold?: number } = {},
+): Promise<MatteResult> {
+  const threshold = opts.threshold ?? 0.5
+  const img = await loadImage(src)
+  const W = img.naturalWidth
+  const H = img.naturalHeight
+
+  const [y0, x0, y1, x1] = box
+  const sx = Math.round((x0 / 1000) * W)
+  const sy = Math.round((y0 / 1000) * H)
+  const sw = Math.max(1, Math.round(((x1 - x0) / 1000) * W))
+  const sh = Math.max(1, Math.round(((y1 - y0) / 1000) * H))
+
+  const { ctx } = ctxOf(sw, sh)
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh)
+  const crop = ctx.getImageData(0, 0, sw, sh)
+
+  if (!maskBase64) {
+    // No mask came back — fall back to the rectangular crop. Still trim, so a
+    // source that *does* carry alpha (the 'native' strategy) gets hugged properly;
+    // on an opaque crop trim() is a no-op.
+    const t = trim(crop)
+    return {
+      src: t.src,
+      bounds: {
+        x: (sx + t.bounds.x * sw) / W,
+        y: (sy + t.bounds.y * sh) / H,
+        w: (t.bounds.w * sw) / W,
+        h: (t.bounds.h * sh) / H,
+      },
+      coverage: t.coverage,
+    }
+  }
+
+  const maskData = await dataOf(`data:image/png;base64,${maskBase64}`, sw, sh)
+  const C = crop.data
+  const M = maskData.data
+  let solid = 0
+
+  for (let i = 0; i < C.length; i += 4) {
+    const p = (M[i] + M[i + 1] + M[i + 2]) / 3 / 255
+    const a = p < threshold ? 0 : Math.min(1, (p - threshold) / (1 - threshold) + p)
+    if (a <= 0) {
+      C[i] = C[i + 1] = C[i + 2] = C[i + 3] = 0
+    } else {
+      C[i + 3] = Math.round(Math.min(1, a) * 255)
+      solid++
+    }
+  }
+
+  const trimmed = trim(crop)
+  return {
+    src: trimmed.src,
+    bounds: {
+      x: (sx + trimmed.bounds.x * sw) / W,
+      y: (sy + trimmed.bounds.y * sh) / H,
+      w: (trimmed.bounds.w * sw) / W,
+      h: (trimmed.bounds.h * sh) / H,
+    },
+    coverage: solid / (sw * sh),
+  }
+}
+
+// ------------------------------------------------------------- utils
+
+/** Crop away fully transparent margins so the layer's box hugs the subject. */
+function trim(data: ImageData): MatteResult {
+  const { width, height, data: D } = data
+  let minX = width
+  let minY = height
+  let maxX = -1
+  let maxY = -1
+  let solid = 0
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (D[(y * width + x) * 4 + 3] > 8) {
+        solid++
+        if (x < minX) minX = x
+        if (x > maxX) maxX = x
+        if (y < minY) minY = y
+        if (y > maxY) maxY = y
+      }
+    }
+  }
+
+  if (maxX < 0) {
+    return { src: toDataUrl(data), bounds: { x: 0, y: 0, w: 1, h: 1 }, coverage: 0 }
+  }
+
+  const w = maxX - minX + 1
+  const h = maxY - minY + 1
+  const { canvas, ctx } = ctxOf(w, h)
+  const src = ctxOf(width, height)
+  src.ctx.putImageData(data, 0, 0)
+  ctx.drawImage(src.canvas, minX, minY, w, h, 0, 0, w, h)
+
+  return {
+    src: canvas.toDataURL('image/png'),
+    bounds: { x: minX / width, y: minY / height, w: w / width, h: h / height },
+    coverage: solid / (width * height),
+  }
+}
+
+/** Rectangular crop by a 0..1000 box — the no-mask fallback for pipeline B. */
+export async function cropBox(src: string, box: [number, number, number, number]) {
+  return maskMatte(src, null, box)
+}
+
+export async function downscale(src: string, maxDim: number): Promise<string> {
+  const img = await loadImage(src)
+  const scale = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight))
+  if (scale >= 1) return src
+  const { canvas, ctx } = ctxOf(img.naturalWidth * scale, img.naturalHeight * scale)
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+  return canvas.toDataURL('image/png')
+}
+
+export async function thumbnail(src: string, size = 320): Promise<string> {
+  const img = await loadImage(src)
+  const scale = Math.min(1, size / Math.max(img.naturalWidth, img.naturalHeight))
+  const { canvas, ctx } = ctxOf(img.naturalWidth * scale, img.naturalHeight * scale)
+  ctx.fillStyle = '#0b0b0d'
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+  return canvas.toDataURL('image/jpeg', 0.72)
+}
+
+export async function imageSize(src: string) {
+  const img = await loadImage(src)
+  return { width: img.naturalWidth, height: img.naturalHeight }
+}
+
+export function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(new Error('Failed to read file'))
+    reader.readAsDataURL(file)
+  })
+}
