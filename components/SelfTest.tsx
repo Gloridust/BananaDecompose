@@ -5,7 +5,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { chromaKeyMatte, dualRenderMatte, loadImage } from '@/lib/matte'
 import BoardCanvas from './Board'
 import GlyphTest from './GlyphTest'
-import type { Board } from '@/lib/types'
+import SceneEditor from './SceneEditor'
+import type { Board, Scene } from '@/lib/types'
 
 // The matting maths is the load-bearing part of pipeline A, and it is the part
 // that costs money to test against the real model. So: build a subject with a
@@ -137,8 +138,30 @@ function syntheticBoard(swatch: string): Board {
       ...arms.flatMap((a) => [
         { id: `n:${a.id}:renders`, kind: 'renders' as const, label: '独立渲染 ×2', branches: [a.id], inputs: ['n:plan'], status: 'ok' as const, images: [{ label: 'a', src: swatch }, { label: 'b', src: swatch }] },
         { id: `n:${a.id}:cuts`, kind: 'cuts' as const, label: '抠图 ×2', branches: [a.id], inputs: [`n:${a.id}:renders`], status: 'ok' as const, images: [{ label: 'a', src: swatch }] },
-        { id: `n:${a.id}:scene`, kind: 'scene' as const, label: a.label, branches: [a.id], inputs: [`n:${a.id}:cuts`, 'n:plate'], status: 'ok' as const, ms: 42000 + arms.indexOf(a) * 9000, images: [{ label: 'scene', src: swatch }], scene: { canvas: { width: 512, height: 512, background: '#111' }, layers: [] } },
+        { id: `n:${a.id}:scene`, kind: 'scene' as const, label: a.label, branches: [a.id], inputs: [`n:${a.id}:cuts`, 'n:plate'], status: 'ok' as const, ms: 42000 + arms.indexOf(a) * 9000, images: [{ label: 'scene', src: swatch }], scene: demoScene(swatch) },
       ]),
+    ],
+  }
+}
+
+/** A scene with one image layer and one text layer — enough to exercise the
+ *  editor's selection, dragging, inline text editing and marquee. */
+function demoScene(swatch: string): Scene {
+  return {
+    canvas: { width: 512, height: 512, background: '#1a1410' },
+    layers: [
+      {
+        id: 'bg', type: 'image', name: '背景板', x: 0, y: 0, w: 512, h: 512,
+        rotation: 0, opacity: 1, visible: true, locked: false, src: swatch, matte: 'none',
+        provenance: '自检用的合成图层',
+      },
+      {
+        id: 'title', type: 'text', name: '晨间萃取', x: 96, y: 60, w: 320, h: 80,
+        rotation: 0, opacity: 1, visible: true, locked: false,
+        text: '晨间萃取', fontFamily: 'Noto Serif SC', fontSize: 64, fontWeight: 700,
+        color: '#f5e6c8', align: 'left', lineHeight: 1.15, letterSpacing: 0, italic: false,
+        provenance: '自检用的文本节点 · 双击可直接改字',
+      },
     ],
   }
 }
@@ -149,6 +172,7 @@ export default function SelfTest() {
   const [demoBoard, setDemoBoard] = useState<Board | null>(null)
   const [hiddenNodes, setHiddenNodes] = useState<Set<string>>(new Set())
   const [hiddenBranches, setHiddenBranches] = useState<Set<string>>(new Set())
+  const [editing, setEditing] = useState<Scene | null>(null)
 
   const run = useCallback(async () => {
     setBusy(true)
@@ -197,6 +221,15 @@ export default function SelfTest() {
         <strong className="text-ink-200"> 这是算法上限</strong>：真实模型两次生成不会像这里一样像素级一致，实际误差会更大。
       </p>
 
+      {editing ? (
+        <SceneEditor
+          title="编辑器自检（合成场景）"
+          scene={editing}
+          onChange={setEditing}
+          onClose={() => setEditing(null)}
+        />
+      ) : null}
+
       <GlyphTest />
 
       {demoBoard ? (
@@ -244,7 +277,7 @@ export default function SelfTest() {
               }
               selectedNodeId={null}
               onSelectNode={() => {}}
-              onOpenScene={() => {}}
+              onOpenScene={(node) => node.scene && setEditing(node.scene)}
             />
           </div>
         </section>

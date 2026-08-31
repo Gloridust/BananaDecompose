@@ -91,7 +91,23 @@ export async function ensureFonts(
   }
 
   if (pending.length) await Promise.all(pending)
-  await document.fonts.ready
+
+  // Unreachable web fonts must degrade, never throw: document.fonts.ready
+  // rejects when a face fails to load, and letting that propagate would take
+  // down the whole text pipeline for anyone behind a restricted network. The
+  // fallback metrics are wrong, but wrong beats nothing on screen.
+  await document.fonts.ready.catch(() => undefined)
+}
+
+/** True when a face actually resolved. Callers can warn instead of silently
+ *  measuring the fallback and reporting it as a confident answer. */
+export function fontAvailable(family: string, weight = 400) {
+  if (typeof document === 'undefined' || !document.fonts) return false
+  try {
+    return document.fonts.check(`${weight} 100px "${family}"`)
+  } catch {
+    return false
+  }
 }
 
 function median(values: number[]) {

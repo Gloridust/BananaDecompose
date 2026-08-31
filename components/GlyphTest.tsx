@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useState } from 'react'
-import { ensureFonts, extractInk, fitText, scoreFonts, scoreMargin, FONT_CANDIDATES } from '@/lib/glyph'
+import { ensureFonts, extractInk, fitText, fontAvailable, scoreFonts, scoreMargin, FONT_CANDIDATES } from '@/lib/glyph'
 import { fontStack } from '@/lib/export'
 
 // Ground truth we control exactly: render type at a known size, colour and
@@ -94,6 +94,7 @@ const TRUTHS: Case['truth'][] = [
 export default function GlyphTest() {
   const [cases, setCases] = useState<Case[]>([])
   const [busy, setBusy] = useState(false)
+  const [fontsMissing, setFontsMissing] = useState<string[]>([])
 
   const run = useCallback(async () => {
     setBusy(true)
@@ -102,6 +103,12 @@ export default function GlyphTest() {
       [...FONT_CANDIDATES, ...TRUTHS.map((t) => ({ family: t.family, weight: t.weight }))],
       TRUTHS.map((t) => t.text).join(''),
     )
+    // Every number below is meaningless if the real faces did not resolve, so
+    // say which are missing rather than reporting fallback metrics as results.
+    setFontsMissing(
+      [...new Set(TRUTHS.map((t) => t.family))].filter((f) => !fontAvailable(f, 700)),
+    )
+
     const out: Case[] = []
 
     for (const truth of TRUTHS) {
@@ -168,6 +175,13 @@ export default function GlyphTest() {
         <strong className="text-ink-200">故意画歪的粗框</strong>（模拟 VLM 给的 box_2d），看它能不能从像素里把真值量回来。
         红色是恢复出来的层叠在原图上 —— 完全重合就说明对齐了，双影就是没对上。
       </p>
+
+      {fontsMissing.length ? (
+        <p className="mb-3 rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-[11px] leading-relaxed text-amber-200">
+          ⚠ 这些字体没能加载：{fontsMissing.join('、')}。测量会退回系统 fallback 的度量，下面的数字不作数。
+          检查一下能不能访问 fonts.googleapis.com。
+        </p>
+      ) : null}
 
       <div className="space-y-3">
         {cases.map((c) => {
