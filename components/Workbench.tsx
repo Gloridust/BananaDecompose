@@ -8,14 +8,15 @@ import BranchLegend from './BranchLegend'
 import SceneEditor from './SceneEditor'
 import BenchmarkPanel from './BenchmarkPanel'
 import { ArtifactStrip, StepLog } from './Panels'
-import { PROMPT_NODE, runCompose } from '@/lib/pipeline/compose'
-import { runDecompose } from '@/lib/pipeline/decompose'
+import { PLAN_NODE, PLATE_NODE, PROMPT_NODE, aspectToSize, preparePlan, preparePlate, runCompose } from '@/lib/pipeline/compose'
+import { SOURCE_NODE, prepareSource, runDecompose } from '@/lib/pipeline/decompose'
 import { getBoard, listBoards, loadSettings, newId, saveBoard, saveSettings } from '@/lib/history'
 import { computeMetrics } from '@/lib/metrics'
 import { fileToDataUrl, thumbnail } from '@/lib/matte'
 import { sceneToPng } from '@/lib/export'
 import { VARIANTS, resolveOptions } from '@/lib/benchmark'
 import { DEFAULT_SELECTION } from '@/lib/benchmark'
+import { setConcurrency } from '@/lib/pipeline/scheduler'
 import type { NodeEmit, PipelineCtx } from '@/lib/pipeline/shared'
 import type {
   Artifact,
@@ -58,6 +59,11 @@ export default function Workbench() {
   const [configured, setConfigured] = useState<boolean | null>(null)
   const [error, setError] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
+  // Branches run concurrently and reuse step ids ('erase', 'flat', 'el-…'), so the
+  // shared log keys on branch + step and carries a label. Without this, whichever
+  // branch reported last would blank out every other branch's steps.
+  const stepsRef = useRef<RunStep[]>([])
+  const artifactsRef = useRef<Artifact[]>([])
   // The board is mutated at high frequency while running; a ref avoids losing
   // node updates to React batching between concurrent element renders.
   const boardRef = useRef<Board | null>(null)
@@ -97,23 +103,41 @@ export default function Workbench() {
     setBoard(next)
   }, [])
 
+  const pushStep = useCallback((branchLabel: string, branchId: string, step: RunStep) => {
+    const id = `${branchId}:${step.id}`
+    const entry: RunStep = { ...step, id, label: `${branchLabel} · ${step.label}` }
+    const i = stepsRef.current.findIndex((x) => x.id === id)
+    if (i === -1) stepsRef.current = [...stepsRef.current, entry]
+    else {
+      const next = [...stepsRef.current]
+      next[i] = entry
+      stepsRef.current = next
+    }
+    setSteps(stepsRef.current)
+  }, [])
+
+  const pushArtifact = useCallback((a: Artifact) => {
+    artifactsRef.current = [...artifactsRef.current, a]
+    setArtifacts(artifactsRef.current)
+  }, [])
+
   // ------------------------------------------------------- board writes
 
   const upsertNode = useCallback(
-    (branchId: string, emitted: NodeEmit) => {
+    (attribution: string[], emitted: NodeEmit) => {
       const cur = boardRef.current
       if (!cur) return
       const nodes = [...cur.nodes]
       const i = nodes.findIndex((n) => n.id === emitted.id)
       if (i === -1) {
-        nodes.push({ ...emitted, branches: [branchId] })
+        nodes.push({ ...emitted, branches: [...attribution] })
       } else {
         const prev = nodes[i]
         nodes[i] = {
           ...prev,
           ...emitted,
           // A shared node accumulates every branch that consumed it.
-          branches: prev.branches.includes(branchId) ? prev.branches : [...prev.branches, branchId],
+          branches: [...new Set([...prev.branches, ...attribution])],
           // Never let a later reuse blank out payload the first producer supplied.
           images: emitted.images ?? prev.images,
           summary: emitted.summary ?? prev.summary,
@@ -141,12 +165,11 @@ export default function Workbench() {
   const runBranch = useCallback(
     async (
       plan: BranchPlan,
-      shared: { plan?: ScenePlan; background?: string; source?: string },
+      shared: { plan?: ScenePlan; background?: string; source?: string; prepared?: boolean },
       signal: AbortSignal,
     ) => {
-      if (!models) return shared
+      if (!models) return
 
-      const collected: RunStep[] = []
       const collectedArtifacts: Artifact[] = []
       const branchTotals = { cost: 0, ms: 0 }
 
@@ -154,22 +177,16 @@ export default function Workbench() {
         signal,
         branchId: plan.id,
         totals: branchTotals,
-        onStep: (step) => {
-          const i = collected.findIndex((s) => s.id === step.id)
-          if (i === -1) collected.push(step)
-          else collected[i] = step
-          setSteps([...collected])
-        },
+        onStep: (step) => pushStep(plan.label, plan.id, step),
         onArtifact: (a) => {
           collectedArtifacts.push(a)
-          setArtifacts([...collectedArtifacts])
+          pushArtifact(a)
         },
-        onNode: (n) => upsertNode(plan.id, n),
+        onNode: (n) => upsertNode([plan.id], n),
       }
 
-      patchBranch(plan.id, { status: 'running' })
+      patchBranch(plan.id, { status: 'running', startedAt: performance.now() })
       const startedAt = performance.now()
-      const next = { ...shared }
 
       try {
         let scene: Scene
@@ -182,19 +199,15 @@ export default function Workbench() {
           })
           scene = res.scene
           tailNodes = res.tailNodes
-          if (!next.plan) next.plan = res.plan
-          // Only a text-free plate is reusable; the baked arm bakes copy into its own.
-          if (!next.background && plan.compose.text === 'live') next.background = res.background
         } else {
           const res = await runDecompose(
             ctx,
-            { prompt: settings.prompt, sourceImage: shared.source },
+            { prompt: settings.prompt, sourceImage: shared.source, prepared: shared.prepared },
             plan.decompose,
             models,
           )
           scene = res.scene
           tailNodes = res.tailNodes
-          if (!next.source) next.source = res.source
         }
 
         const metrics = await computeMetrics(scene, collectedArtifacts, {
@@ -204,14 +217,15 @@ export default function Workbench() {
 
         const sceneNodeId = `n:${plan.id}:scene`
         const flattened = await sceneToPng(scene)
-        upsertNode(plan.id, {
+        const pathMs = Math.round(performance.now() - startedAt)
+        upsertNode([plan.id], {
           id: sceneNodeId,
           kind: 'scene',
           label: plan.label,
           detail: `${scene.layers.length} 层 · ${scene.layers.filter((l) => l.type === 'text').length} 文字`,
           inputs: tailNodes,
           status: 'ok',
-          ms: Math.round(performance.now() - startedAt),
+          ms: pathMs,
           scene,
           metrics,
           images: [{ label: '合成结果', src: await thumbnail(flattened, 420) }],
@@ -222,19 +236,21 @@ export default function Workbench() {
           metrics,
           sceneNodeId,
           cost: branchTotals.cost,
-          ms: Math.round(performance.now() - startedAt),
+          ms: pathMs,
+          endedAt: performance.now(),
         })
       } catch (err) {
         const message = (err as Error).message
         const cancelled = (err as Error).name === 'Cancelled'
-        if (!cancelled) setError(message)
+        // A single branch failing is data, not a session-level error — the node
+        // and the legend dot already say so, so no global banner.
         patchBranch(plan.id, {
           status: cancelled ? 'skipped' : 'error',
           error: cancelled ? undefined : message,
           cost: branchTotals.cost,
           ms: Math.round(performance.now() - startedAt),
+          endedAt: performance.now(),
         })
-        if (cancelled) throw err
       }
 
       const cur = boardRef.current
@@ -242,14 +258,12 @@ export default function Workbench() {
         commit({
           ...cur,
           totalCost: cur.branches.reduce((a, b) => a + b.cost, 0),
-          totalMs: cur.branches.reduce((a, b) => a + b.ms, 0),
+          serialMs: cur.prepMs + cur.branches.reduce((a, b) => a + b.ms, 0),
           nodeCount: cur.nodes.length,
         })
       }
-
-      return next
     },
-    [models, settings.prompt, upsertNode, patchBranch, commit],
+    [models, settings.prompt, upsertNode, patchBranch, commit, pushStep, pushArtifact],
   )
 
   // ------------------------------------------------- run a whole board
@@ -259,14 +273,23 @@ export default function Workbench() {
       if (!models || !plans.length) return
       const controller = new AbortController()
       abortRef.current = controller
+      setConcurrency(settings.concurrency)
       setRunning(true)
       setError(null)
+      stepsRef.current = []
+      artifactsRef.current = []
       setSteps([])
       setArtifacts([])
       setHiddenBranches(new Set())
       setHiddenNodes(new Set())
       setSelectedNodeId(null)
 
+      const composeArms = plans.filter((p) => p.pipeline === 'compose')
+      const decomposeArms = plans.filter((p) => p.pipeline === 'decompose')
+      // Only text-free plates are shareable; the baked arm renders its own copy in.
+      const plateArms = composeArms.filter((p) => p.compose.text === 'live')
+
+      const boardStart = performance.now()
       const fresh: Board = {
         id: newId(),
         createdAt: Date.now(),
@@ -274,7 +297,10 @@ export default function Workbench() {
         branchCount: plans.length,
         nodeCount: 0,
         totalMs: 0,
+        serialMs: 0,
+        prepMs: 0,
         totalCost: 0,
+        concurrency: settings.concurrency,
         models,
         fromUpload: Boolean(sourceImage),
         branches: plans.map((p) => ({
@@ -300,33 +326,86 @@ export default function Workbench() {
       }
       commit(fresh)
 
-      let shared: { plan?: ScenePlan; background?: string; source?: string } = {
+      const shared: { plan?: ScenePlan; background?: string; source?: string; prepared?: boolean } = {
         source: sourceImage ?? undefined,
+        prepared: false,
       }
+      const prepTotals = { cost: 0, ms: 0 }
+
+      /** A context whose nodes are credited to every branch that will consume them. */
+      const prepCtx = (attribution: string[]): PipelineCtx => ({
+        signal: controller.signal,
+        branchId: 'shared',
+        attribution,
+        totals: prepTotals,
+        onStep: (step) => pushStep('共享', 'shared', step),
+        onArtifact: pushArtifact,
+        onNode: (n) => upsertNode(attribution, n),
+      })
 
       try {
-        for (let i = 0; i < plans.length; i++) {
-          if (controller.signal.aborted) break
-          setProgress({ label: plans[i].label, index: i + 1, total: plans.length })
-          shared = await runBranch(plans[i], shared, controller.signal)
-        }
-      } catch {
-        /* cancellation already recorded on the branch */
-      } finally {
-        setRunning(false)
-        setProgress(null)
-        abortRef.current = null
+        // ── phase 0: shared upstream, produced once. The two pipelines have no
+        // dependency on each other, so their prep runs concurrently.
+        setProgress({ label: '共享上游：规划 / 背景板 / 来源图', index: 0, total: plans.length })
+        await Promise.all([
+          (async () => {
+            if (!composeArms.length) return
+            const ctx = prepCtx(composeArms.map((p) => p.id))
+            const opts = composeArms[0].compose
+            shared.plan = await preparePlan(ctx, settings.prompt, opts, aspectToSize(opts.aspectRatio, opts.resolution))
+            if (plateArms.length) {
+              shared.background = await preparePlate(prepCtx(plateArms.map((p) => p.id)), shared.plan, opts, models)
+            }
+          })(),
+          (async () => {
+            if (!decomposeArms.length || shared.source) return
+            const ctx = prepCtx(decomposeArms.map((p) => p.id))
+            shared.source = await prepareSource(ctx, settings.prompt, decomposeArms[0].decompose, models)
+            shared.prepared = true
+          })(),
+        ])
+      } catch (err) {
+        if ((err as Error).name !== 'Cancelled') setError(`共享上游失败：${(err as Error).message}`)
       }
 
-      const done = boardRef.current
-      if (done) {
-        const sceneNode = done.nodes.find((n) => n.kind === 'scene' && n.images?.length)
-        const finished: Board = { ...done, thumbnail: sceneNode?.images?.[0]?.src, nodeCount: done.nodes.length }
+      const prepMs = Math.round(performance.now() - boardStart)
+      const withPrep = boardRef.current
+      if (withPrep) commit({ ...withPrep, prepMs, totalCost: prepTotals.cost })
+
+      // ── phase 1: every branch at once. The global scheduler bounds total load,
+      // so branch count no longer multiplies into a request storm.
+      if (shared.plan || shared.source || !plans.some((p) => p.pipeline === 'compose')) {
+        let done = 0
+        await Promise.all(
+          plans.map(async (p) => {
+            await runBranch(p, shared, controller.signal)
+            done++
+            setProgress({ label: p.label, index: done, total: plans.length })
+          }),
+        )
+      }
+
+      setRunning(false)
+      setProgress(null)
+      abortRef.current = null
+
+      const finishedBoard = boardRef.current
+      if (finishedBoard) {
+        const sceneNode = finishedBoard.nodes.find((n) => n.kind === 'scene' && n.images?.length)
+        const finished: Board = {
+          ...finishedBoard,
+          thumbnail: sceneNode?.images?.[0]?.src,
+          nodeCount: finishedBoard.nodes.length,
+          prepMs,
+          totalMs: Math.round(performance.now() - boardStart),
+          serialMs: prepMs + finishedBoard.branches.reduce((a, b) => a + b.ms, 0),
+          totalCost: prepTotals.cost + finishedBoard.branches.reduce((a, b) => a + b.cost, 0),
+        }
         commit(finished)
         await saveBoard(finished).catch(() => undefined)
       }
     },
-    [models, settings.prompt, sourceImage, commit, runBranch],
+    [models, settings.prompt, settings.concurrency, sourceImage, commit, runBranch, upsertNode, pushStep, pushArtifact],
   )
 
   const runSingle = useCallback(() => {
@@ -430,8 +509,8 @@ export default function Workbench() {
       ) : null}
       {progress ? (
         <div className="shrink-0 border-b border-banana-500/40 bg-banana-500/10 px-4 py-2 text-xs text-banana-200">
-          第 {progress.index}/{progress.total} 条分支：{progress.label}
-          <span className="ml-2 text-banana-400/70">节点会实时长到画布上</span>
+          {progress.index === 0 ? progress.label : `已完成 ${progress.index}/${progress.total} 条分支 · 最近：${progress.label}`}
+          <span className="ml-2 text-banana-400/70">所有分支同时在跑，节点实时长到画布上</span>
         </div>
       ) : null}
       {error ? <div className="shrink-0 border-b border-rose-500/40 bg-rose-500/10 px-4 py-2 text-xs text-rose-200">{error}</div> : null}
@@ -467,6 +546,7 @@ export default function Workbench() {
             <BranchLegend
               board={board}
               hidden={hiddenBranches}
+              running={running}
               onToggle={toggleBranch}
               onSolo={soloBranch}
               onShowAll={() => setHiddenBranches(new Set())}
@@ -497,7 +577,7 @@ export default function Workbench() {
           <div className="scrollbar-thin max-h-44 shrink-0 overflow-y-auto border-t border-ink-800 bg-ink-900">
             <div className="grid grid-cols-1 divide-y divide-ink-800 xl:grid-cols-2 xl:divide-x xl:divide-y-0">
               <div className="p-3">
-                <h3 className="mb-2 font-mono text-[10px] uppercase tracking-widest text-ink-400">当前分支步骤</h3>
+                <h3 className="mb-2 font-mono text-[10px] uppercase tracking-widest text-ink-400">步骤（所有分支交错）</h3>
                 <StepLog steps={steps} />
               </div>
               <div className="min-w-0 p-3">

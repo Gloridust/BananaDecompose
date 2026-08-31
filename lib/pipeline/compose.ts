@@ -12,11 +12,13 @@ import type {
   UsageInfo,
 } from '../types'
 import { backgroundPrompt, elementPrompt } from '../prompts'
-import { boxToRect, checkCancelled, emit, hexOr, mapLimit, skip, track, type PipelineCtx } from './shared'
+import { api, boxToRect, checkCancelled, emit, hexOr, mapLimit, skip, track, tryTrack, type PipelineCtx } from './shared'
 
 type GenRes = { images: string[]; usage: UsageInfo; model: string }
 
-const ELEMENT_CONCURRENCY = 2
+/** Per-branch fan-out. The global scheduler bounds actual load, so this only
+ *  needs to be wide enough that one branch alone can saturate the pool. */
+const ELEMENT_CONCURRENCY = 8
 
 /** Grounding masks arrive as base64 text; a smaller frame is a smaller payload. */
 export const SEGMENT_INPUT_MAX_DIM = 768
@@ -34,6 +36,64 @@ export type ComposeResult = {
   background: string
   /** Board nodes the assembled scene descends from. */
   tailNodes: string[]
+}
+
+/** Shared upstream, step 1. Every compose branch consumes the same plan. */
+export async function preparePlan(
+  ctx: PipelineCtx,
+  prompt: string,
+  opts: ComposeOptions,
+  size: { width: number; height: number },
+): Promise<ScenePlan> {
+  return track(
+    ctx,
+    'plan',
+    '规划 Scene JSON',
+    async () => {
+      const json = await api<any>('/api/plan', ctx, {
+        prompt,
+        width: size.width,
+        height: size.height,
+        maxElements: opts.maxElements,
+        textStrategy: 'live',
+        model: opts.visionModel || undefined,
+      })
+      const p = json.plan as ScenePlan
+      return {
+        value: p,
+        usage: json.usage as UsageInfo,
+        detail: `${p.elements.length} 个元素 · ${p.texts.length} 段文字`,
+        summary: planSummary(p),
+      }
+    },
+    { id: PLAN_NODE, kind: 'plan', inputs: [PROMPT_NODE] },
+  )
+}
+
+/** Shared upstream, step 2. Only text-free plates are shareable — the baked arm
+ *  renders copy into its own and is excluded. */
+export async function preparePlate(
+  ctx: PipelineCtx,
+  plan: ScenePlan,
+  opts: ComposeOptions,
+  models: { image: string },
+): Promise<string> {
+  return track(
+    ctx,
+    'background',
+    '生成背景板',
+    async () => {
+      const json = await gen(ctx, {
+        prompt: backgroundPrompt(plan.background.prompt),
+        aspectRatio: opts.aspectRatio,
+        resolution: opts.resolution,
+        model: models.image,
+      })
+      ctx.onArtifact({ label: '背景板', src: json.images[0], role: 'plate' })
+      return { value: json.images[0], usage: json.usage, images: [{ label: '背景板', src: json.images[0] }] }
+    },
+    { id: PLATE_NODE, kind: 'plate', inputs: [PLAN_NODE] },
+  )
 }
 
 /**
@@ -71,29 +131,7 @@ export async function runCompose(
     })
     plan = reused
   } else {
-    plan = await track(
-      ctx,
-      'plan',
-      '规划 Scene JSON',
-      async () => {
-        const json = await post('/api/plan', ctx, {
-          prompt,
-          width,
-          height,
-          maxElements: opts.maxElements,
-          textStrategy: opts.text,
-          model: opts.visionModel || undefined,
-        })
-        const p = json.plan as ScenePlan
-        return {
-          value: p,
-          usage: json.usage as UsageInfo,
-          detail: `${p.elements.length} 个元素 · ${p.texts.length} 段文字`,
-          summary: planSummary(p),
-        }
-      },
-      { id: PLAN_NODE, kind: 'plan', inputs: [PROMPT_NODE] },
-    )
+    plan = await preparePlan(ctx, prompt, opts, { width, height })
   }
 
   const bakeText = opts.text === 'baked'
@@ -291,7 +329,7 @@ export async function runCompose(
       'ocr',
       'OCR 回收烘焙的文字',
       async () => {
-        const json = await post('/api/analyze', ctx, {
+        const json = await api<any>('/api/analyze', ctx, {
           image: bgSrc,
           width,
           height,
@@ -310,12 +348,12 @@ export async function runCompose(
     )
 
     const eraseNode = `n:${B}:erase`
-    backgroundSrc = await track(
+    backgroundSrc = await tryTrack(
       ctx,
       'erase',
       '擦除文字，重建背景',
       async () => {
-        const json = await post('/api/erase', ctx, {
+        const json = await api<any>('/api/erase', ctx, {
           image: bgSrc,
           targets: [],
           aspectRatio: opts.aspectRatio,
@@ -330,6 +368,7 @@ export async function runCompose(
         }
       },
       { id: eraseNode, kind: 'erase', inputs: [plateNode, ocrNode] },
+      { value: bgSrc, note: '重建被拒，背景层沿用原图（文字会重影）' },
     )
 
     textLayers = recovered.map((t, i) => analysisTextToLayer(t, width, height, i))
@@ -370,23 +409,11 @@ export async function runCompose(
 
 // ------------------------------------------------------------- helpers
 
-async function post(path: string, ctx: PipelineCtx, body: unknown) {
-  const res = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: ctx.signal,
-  })
-  const json = await res.json()
-  if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-  return json
-}
-
 async function gen(
   ctx: PipelineCtx,
   body: { prompt: string; aspectRatio?: string; resolution?: string; model?: string; seed?: number },
 ): Promise<GenRes> {
-  return (await post('/api/generate', ctx, body)) as GenRes
+  return api<GenRes>('/api/generate', ctx, body)
 }
 
 export type SegmentResult = {
@@ -402,7 +429,7 @@ export type SegmentResult = {
  *  as base64 text, so a smaller frame is a directly smaller — and faster — payload. */
 export async function segment(ctx: PipelineCtx, image: string, label: string, model: string): Promise<SegmentResult> {
   const small = await downscale(image, SEGMENT_INPUT_MAX_DIM)
-  return (await post('/api/segment', ctx, { image: small, label, model })) as SegmentResult
+  return api<SegmentResult>('/api/segment', ctx, { image: small, label, model })
 }
 
 function planSummary(p: ScenePlan) {

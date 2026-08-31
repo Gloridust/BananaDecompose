@@ -114,7 +114,10 @@ function syntheticBoard(swatch: string): Board {
     branchCount: arms.length,
     nodeCount: 0,
     totalMs: 0,
+    serialMs: 0,
+    prepMs: 0,
     totalCost: 0,
+    concurrency: 4,
     models: { image: 'image', vision: 'vision', grounding: 'grounding' },
     branches: arms.map((a) => ({
       id: a.id,
@@ -132,7 +135,7 @@ function syntheticBoard(swatch: string): Board {
       ...arms.flatMap((a) => [
         { id: `n:${a.id}:renders`, kind: 'renders' as const, label: '独立渲染 ×2', branches: [a.id], inputs: ['n:plan'], status: 'ok' as const, images: [{ label: 'a', src: swatch }, { label: 'b', src: swatch }] },
         { id: `n:${a.id}:cuts`, kind: 'cuts' as const, label: '抠图 ×2', branches: [a.id], inputs: [`n:${a.id}:renders`], status: 'ok' as const, images: [{ label: 'a', src: swatch }] },
-        { id: `n:${a.id}:scene`, kind: 'scene' as const, label: a.label, branches: [a.id], inputs: [`n:${a.id}:cuts`, 'n:plate'], status: 'ok' as const, images: [{ label: 'scene', src: swatch }], scene: { canvas: { width: 512, height: 512, background: '#111' }, layers: [] } },
+        { id: `n:${a.id}:scene`, kind: 'scene' as const, label: a.label, branches: [a.id], inputs: [`n:${a.id}:cuts`, 'n:plate'], status: 'ok' as const, ms: 42000 + arms.indexOf(a) * 9000, images: [{ label: 'scene', src: swatch }], scene: { canvas: { width: 512, height: 512, background: '#111' }, layers: [] } },
       ]),
     ],
   }

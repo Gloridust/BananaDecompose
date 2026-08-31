@@ -243,18 +243,19 @@ Keep the mask compact. Output only the JSON list, nothing else.`
 // -------------------------------------------------------------- erase
 
 export function erasePrompt(targets: string[]) {
-  const what = targets.length
-    ? `Remove these elements completely: ${targets.map((t) => `"${t}"`).join(', ')}. Also remove every piece of text.`
-    : `Remove every piece of text, lettering, number and caption.`
+  const subjects = targets.length
+    ? `the ${targets.map((t) => `"${t}"`).join(', ')}, and any written characters,`
+    : 'any written characters'
 
-  return `${what}
+  return `Restore this image to its empty background state.
 
-Reconstruct what was behind them so the result looks like a clean, complete, untouched background plate.
-Continue the surrounding textures, gradients, patterns and lighting naturally across the vacated areas.
-Leave no ghosting, no blur patch, no smudge, no outline, and no leftover fragment where anything used to be.
-Change absolutely nothing else: identical framing, identical composition, identical colours, identical dimensions.`
-}
+Show the underlying surface exactly as it looked before ${subjects} were placed onto it —
+bare, uninterrupted, and complete. Extend the existing textures, gradients, patterns, grain and
+lighting continuously across the whole frame so the surface reads as one unbroken material.
 
-export function eraseTextOnlyPrompt() {
-  return erasePrompt([])
+No residue of anything that used to sit on the surface: no ghosting, no blur patches, no smudges,
+no faint outlines, no partial fragments.
+
+Everything else is unchanged: identical framing, identical composition, identical palette,
+identical dimensions.`
 }

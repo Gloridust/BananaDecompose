@@ -1,5 +1,7 @@
 'use client'
 
+import { useEffect, useState } from 'react'
+import { load } from '@/lib/pipeline/scheduler'
 import type { Board } from '@/lib/types'
 
 const STATUS_DOT: Record<string, string> = {
@@ -14,18 +16,29 @@ const STATUS_DOT: Record<string, string> = {
 export default function BranchLegend({
   board,
   hidden,
+  running,
   onToggle,
   onSolo,
   onShowAll,
 }: {
   board: Board
   hidden: Set<string>
+  running: boolean
   onToggle: (id: string) => void
   onSolo: (id: string) => void
   onShowAll: () => void
 }) {
+  const [gauge, setGauge] = useState({ active: 0, queued: 0, limit: 0 })
+
+  useEffect(() => {
+    if (!running) return
+    const t = setInterval(() => setGauge(load()), 250)
+    return () => clearInterval(t)
+  }, [running])
+
   if (!board.branches.length) return null
   const anyHidden = hidden.size > 0
+  const saved = board.serialMs > 0 && board.totalMs > 0 ? 1 - board.totalMs / board.serialMs : 0
 
   return (
     <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-ink-800 bg-ink-900 px-3 py-2">
@@ -43,6 +56,11 @@ export default function BranchLegend({
             >
               <span className={`h-1.5 w-1.5 rounded-full ${off ? 'bg-ink-700' : STATUS_DOT[b.status] ?? 'bg-ink-600'}`} />
               <span className={off ? 'line-through' : ''}>{b.label}</span>
+              {b.ms ? (
+                <span className="font-mono text-[9px] tabular-nums text-ink-600" title="这条路径的墙钟耗时">
+                  {(b.ms / 1000).toFixed(0)}s
+                </span>
+              ) : null}
               {b.metrics?.liveText === false ? <span className="font-mono text-[8px] text-amber-400/70">OCR</span> : null}
             </button>
             <button
@@ -62,8 +80,27 @@ export default function BranchLegend({
           全部显示
         </button>
       ) : null}
-      <span className="ml-auto font-mono text-[9px] tabular-nums text-ink-600">
-        {board.nodes.length} 节点 · ${board.totalCost.toFixed(4)} · {(board.totalMs / 1000).toFixed(1)}s
+      <span className="ml-auto flex items-center gap-2 font-mono text-[9px] tabular-nums">
+        {running ? (
+          <span className="rounded bg-banana-500/15 px-1.5 py-0.5 text-banana-400" title="全局在飞 / 排队 / 上限">
+            在飞 {gauge.active}/{gauge.limit}
+            {gauge.queued ? ` · 排队 ${gauge.queued}` : ''}
+          </span>
+        ) : null}
+        <span className="text-ink-600">
+          {board.nodes.length} 节点 · ${board.totalCost.toFixed(4)}
+        </span>
+        {board.totalMs ? (
+          <span className="text-ink-400" title="墙钟耗时。串行是把每条分支挨个跑完的等价时间">
+            墙钟 {(board.totalMs / 1000).toFixed(1)}s
+            {board.serialMs > board.totalMs ? (
+              <span className="text-emerald-400">
+                {' '}
+                / 串行 {(board.serialMs / 1000).toFixed(0)}s · 省 {Math.round(saved * 100)}%
+              </span>
+            ) : null}
+          </span>
+        ) : null}
       </span>
     </div>
   )

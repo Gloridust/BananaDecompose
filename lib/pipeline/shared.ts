@@ -1,5 +1,6 @@
 'use client'
 
+import { schedule } from './scheduler'
 import type { Artifact, BoardNode, RunStep, UsageInfo } from '../types'
 
 /** A node emitted by a pipeline. The board owner merges by id and records which
@@ -8,8 +9,12 @@ export type NodeEmit = Omit<BoardNode, 'branches'>
 
 export type PipelineCtx = {
   signal?: AbortSignal
-  /** Which branch of the board this execution belongs to. */
+  /** Namespaces per-branch node ids. */
   branchId: string
+  /** Branches that consume the nodes this execution emits. The shared-upstream
+   *  prepare phase lists every branch it feeds, so those nodes are drawn once
+   *  and badged with how many chains depend on them. */
+  attribution?: string[]
   onStep: (step: RunStep) => void
   onArtifact: (artifact: Artifact) => void
   onNode: (node: NodeEmit) => void
@@ -28,16 +33,22 @@ export function checkCancelled(ctx: PipelineCtx) {
   if (ctx.signal?.aborted) throw new Cancelled()
 }
 
-export async function api<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(path, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal,
+/** Every model call goes through the global scheduler, so total in-flight
+ *  requests stay bounded no matter how many branches are running at once. */
+export async function api<T>(path: string, ctx: PipelineCtx, body: unknown): Promise<T> {
+  checkCancelled(ctx)
+  return schedule(async () => {
+    checkCancelled(ctx)
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: ctx.signal,
+    })
+    const json = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
+    if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+    return json as T
   })
-  const json = await res.json().catch(() => ({ error: `HTTP ${res.status}` }))
-  if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-  return json as T
 }
 
 /** Describes the board node a unit of work produces. */
@@ -100,6 +111,44 @@ export function emit(ctx: PipelineCtx, node: NodeEmit) {
   ctx.onNode(node)
 }
 
+/**
+ * Like track(), but a failure degrades instead of killing the branch.
+ *
+ * Provider-side refusals are routine here — Gemini's copyright filter rejects
+ * background-restoration calls on artwork containing stylised type often enough
+ * that treating it as fatal would throw away an otherwise complete branch.
+ */
+export async function tryTrack<T>(
+  ctx: PipelineCtx,
+  id: string,
+  label: string,
+  fn: () => Promise<{
+    value: T
+    usage?: UsageInfo
+    detail?: string
+    images?: { label: string; src: string }[]
+    summary?: string
+  }>,
+  node: NodeSpec,
+  fallback: { value: T; note: string },
+): Promise<T> {
+  try {
+    return await track(ctx, id, label, fn, node)
+  } catch (err) {
+    if (err instanceof Cancelled || (err as Error)?.name === 'Cancelled') throw err
+    const message = (err as Error).message
+    ctx.onStep({ id, label, status: 'skipped', detail: `${fallback.note}（${message}）` })
+    ctx.onNode({
+      ...node,
+      label,
+      status: 'skipped',
+      detail: fallback.note,
+      error: message,
+    })
+    return fallback.value
+  }
+}
+
 /** 0..1000 [y0,x0,y1,x1] -> pixel rect on a w x h canvas. */
 export function boxToRect(box: [number, number, number, number], w: number, h: number) {
   const [y0, x0, y1, x1] = box
@@ -113,7 +162,8 @@ export function boxToRect(box: [number, number, number, number], w: number, h: n
   }
 }
 
-/** Run promises with a concurrency cap — image calls are slow and rate-limited. */
+/** Fan items out within one branch. The real throttle is the global scheduler —
+ *  this cap only bounds how much of one branch's work is outstanding at once. */
 export async function mapLimit<A, B>(items: A[], limit: number, fn: (item: A, index: number) => Promise<B>) {
   const results = new Array<B>(items.length)
   let cursor = 0

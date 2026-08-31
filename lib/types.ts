@@ -193,7 +193,10 @@ export type BoardBranch = {
   metrics?: RunMetrics
   sceneNodeId?: string
   cost: number
+  /** Wall-clock for this branch's own path, start to finished scene. */
   ms: number
+  startedAt?: number
+  endedAt?: number
   error?: string
 }
 
@@ -204,8 +207,14 @@ export type BoardMeta = {
   thumbnail?: string
   branchCount: number
   nodeCount: number
+  /** Wall-clock for the whole board — branches overlap, so this is not a sum. */
   totalMs: number
+  /** What the same work would have cost in wall-clock run one branch at a time. */
+  serialMs: number
+  /** Shared-upstream phase: plan, plate and source, produced once for everyone. */
+  prepMs: number
   totalCost: number
+  concurrency: number
   models: { image: string; vision: string; grounding: string }
   /** True when the decompose branches started from an uploaded raster. */
   fromUpload?: boolean

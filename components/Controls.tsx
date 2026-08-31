@@ -9,12 +9,15 @@ export const RESOLUTIONS = ['1K', '2K', '4K']
 export type Settings = {
   pipeline: PipelineId
   prompt: string
+  /** Global cap on in-flight model calls, across every branch at once. */
+  concurrency: number
   compose: ComposeOptions
   decompose: DecomposeOptions
 }
 
 export const DEFAULT_SETTINGS: Settings = {
   pipeline: 'compose',
+  concurrency: 4,
   prompt: '一张咖啡品鉴会的海报：暖褐色纸质背景，一只手冲壶、一个陶瓷杯、几颗散落的咖啡豆，标题「晨间萃取」，副标题「周六 9:00 · 三号仓库」',
   compose: { matte: 'dual', text: 'live', aspectRatio: '4:5', resolution: '1K', maxElements: 4, visionModel: '' },
   decompose: { aspectRatio: '4:5', resolution: '1K', useMasks: true, inpaintBackground: true, maxElements: 6, groundingModel: '', visionModel: '' },
@@ -99,6 +102,24 @@ export default function Controls({
           {running ? '取消运行' : sourceImage && !isCompose ? '拆解这张图' : '运行'}
         </button>
       </div>
+
+      <label className="block">
+        <span className="mb-1 flex items-baseline justify-between font-mono text-[9px] uppercase tracking-wide text-ink-400">
+          <span>并发上限</span>
+          <span className="tabular-nums text-ink-200">{settings.concurrency}</span>
+        </span>
+        <input
+          type="range"
+          min={1}
+          max={10}
+          value={settings.concurrency}
+          onChange={(e) => onChange({ concurrency: Number(e.target.value) })}
+          className="w-full accent-banana-500"
+        />
+        <span className="mt-1 block text-[10px] leading-snug text-ink-400">
+          全局同时在飞的模型调用数，所有分支共用这一个池子。调高更快，但更容易撞上限流 —— 撞了就调回来。
+        </span>
+      </label>
 
       {models ? (
         <p className="font-mono text-[9px] leading-relaxed text-ink-600">

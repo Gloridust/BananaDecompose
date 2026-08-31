@@ -276,7 +276,7 @@ function NodeCard({
           ) : null}
         </div>
 
-        {node.ms != null || node.cost ? (
+        {(node.ms != null || node.cost) && !isScene ? (
           <p className="mt-1 shrink-0 font-mono text-[8px] tabular-nums text-ink-600">
             {node.ms != null ? `${(node.ms / 1000).toFixed(1)}s` : ''}
             {node.cost ? ` · $${node.cost.toFixed(4)}` : ''}
@@ -312,6 +312,11 @@ function ScenePreview({ node, onOpen }: { node: BoardNode; onOpen: () => void })
 
   return (
     <div className="flex h-full flex-col gap-1">
+      {node.ms != null ? (
+        <p className="shrink-0 font-mono text-[11px] font-semibold tabular-nums text-banana-400" title="这条路径从分支开始到成品的墙钟耗时">
+          ⏱ {(node.ms / 1000).toFixed(1)}s
+        </p>
+      ) : null}
       <button
         onClick={(e) => {
           e.stopPropagation()

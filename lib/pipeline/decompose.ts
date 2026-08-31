@@ -11,10 +11,10 @@ import type {
   TextLayer,
   UsageInfo,
 } from '../types'
-import { boxToRect, checkCancelled, emit, hexOr, mapLimit, skip, track, type PipelineCtx } from './shared'
+import { api, boxToRect, checkCancelled, emit, hexOr, mapLimit, skip, track, tryTrack, type PipelineCtx } from './shared'
 import { PROMPT_NODE, aspectToSize, segment } from './compose'
 
-const SEG_CONCURRENCY = 2
+const SEG_CONCURRENCY = 8
 
 /**
  * Pipeline B — post-hoc decomposition, pure API.
@@ -29,9 +29,38 @@ export type DecomposeResult = { scene: Scene; source: string; tailNodes: string[
 /** Every decompose branch of a board starts from the same flat raster. */
 export const SOURCE_NODE = 'n:source'
 
+/** Shared upstream for pipeline B: generate the flat raster once for every branch. */
+export async function prepareSource(
+  ctx: PipelineCtx,
+  prompt: string,
+  opts: DecomposeOptions,
+  models: { image: string },
+): Promise<string> {
+  return track(
+    ctx,
+    'flat',
+    '生成一张拍平的成品图',
+    async () => {
+      const json = await api<any>('/api/generate', ctx, {
+        prompt: flatPrompt(prompt, true),
+        aspectRatio: opts.aspectRatio,
+        resolution: opts.resolution,
+        model: models.image,
+      })
+      ctx.onArtifact({ label: '来源平图', src: json.images[0], role: 'source' })
+      return {
+        value: json.images[0] as string,
+        usage: json.usage as UsageInfo,
+        images: [{ label: '来源平图', src: json.images[0] }],
+      }
+    },
+    { id: SOURCE_NODE, kind: 'source', inputs: [PROMPT_NODE] },
+  )
+}
+
 export async function runDecompose(
   ctx: PipelineCtx,
-  input: { prompt: string; sourceImage?: string },
+  input: { prompt: string; sourceImage?: string; prepared?: boolean },
   opts: DecomposeOptions,
   models: { image: string; vision: string; grounding: string },
 ): Promise<DecomposeResult> {
@@ -46,13 +75,14 @@ export async function runDecompose(
     const size = await imageSize(flat)
     width = size.width
     height = size.height
-    skip(ctx, 'flat', '来源图', `用户上传 · ${width}×${height}`)
+    const origin = input.prepared ? '共享来源图' : '用户上传'
+    skip(ctx, 'flat', '来源图', `${origin} · ${width}×${height}`)
     ctx.onArtifact({ label: '来源平图', src: flat, role: 'source' })
     emit(ctx, {
       id: SOURCE_NODE,
       kind: 'source',
       label: '来源平图',
-      detail: `用户上传 · ${width}×${height}`,
+      detail: `${origin} · ${width}×${height}`,
       inputs: [PROMPT_NODE],
       status: 'ok',
       images: [{ label: '来源平图', src: flat }],
@@ -64,19 +94,12 @@ export async function runDecompose(
       'flat',
       '生成一张拍平的成品图',
       async () => {
-        const res = await fetch('/api/generate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            prompt: flatPrompt(input.prompt, true),
-            aspectRatio: opts.aspectRatio,
-            resolution: opts.resolution,
-            model: models.image,
-          }),
-          signal: ctx.signal,
+        const json = await api<any>('/api/generate', ctx, {
+          prompt: flatPrompt(input.prompt, true),
+          aspectRatio: opts.aspectRatio,
+          resolution: opts.resolution,
+          model: models.image,
         })
-        const json = await res.json()
-        if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
         ctx.onArtifact({ label: '来源平图', src: json.images[0], role: 'source' })
         return {
           value: json.images[0] as string,
@@ -98,14 +121,13 @@ export async function runDecompose(
     'analyze',
     '读版面：元素 + 文字 + z-order',
     async () => {
-      const res = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: flat, width, height, maxElements: opts.maxElements, model: opts.visionModel || undefined }),
-        signal: ctx.signal,
+      const json = await api<any>('/api/analyze', ctx, {
+        image: flat,
+        width,
+        height,
+        maxElements: opts.maxElements,
+        model: opts.visionModel || undefined,
       })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
       const a = json.analysis as SceneAnalysis
       const els = a.elements.map((e) => `· ${e.label}`).join('\n')
       const txt = a.texts.map((t) => `「${t.content}」`).join('  ')
@@ -243,25 +265,18 @@ export async function runDecompose(
   const plateNode = `n:${B}:erase`
   let plate = flat
   if (opts.inpaintBackground) {
-    plate = await track(
+    plate = await tryTrack(
       ctx,
       'inpaint',
       '擦除元素与文字，重建背景板',
       async () => {
-        const res = await fetch('/api/erase', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            image: flat,
-            targets: analysis.elements.map((e) => e.label),
-            aspectRatio: opts.aspectRatio,
-            resolution: opts.resolution,
-            model: models.image,
-          }),
-          signal: ctx.signal,
+        const json = await api<any>('/api/erase', ctx, {
+          image: flat,
+          targets: analysis.elements.map((e) => e.label),
+          aspectRatio: opts.aspectRatio,
+          resolution: opts.resolution,
+          model: models.image,
         })
-        const json = await res.json()
-        if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
         ctx.onArtifact({ label: '重建的背景板', src: json.image, role: 'plate' })
         return {
           value: json.image as string,
@@ -270,6 +285,7 @@ export async function runDecompose(
         }
       },
       { id: plateNode, kind: 'erase', inputs: [SOURCE_NODE, analyzeNode] },
+      { value: flat, note: '重建被拒，背景层沿用原图（元素会重影）' },
     )
   } else {
     skip(
