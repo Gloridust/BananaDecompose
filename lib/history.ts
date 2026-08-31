@@ -1,71 +1,72 @@
 'use client'
 
 import { clear, createStore, del, get, set } from 'idb-keyval'
-import type { Run, RunMeta } from './types'
+import type { Board, BoardMeta } from './types'
 
-// The run index lives in localStorage so the history list paints instantly and
-// stays inspectable in devtools. The full runs — which carry megabytes of layer
-// PNGs as data URIs — live in IndexedDB, because localStorage's ~5MB quota fits
-// roughly two generated images and this demo exists to compare many runs.
-const INDEX_KEY = 'bd:runs:index'
-const store = createStore('banana-decompose', 'runs')
+// The board index lives in localStorage so the history list paints instantly and
+// stays inspectable in devtools. Full boards — megabytes of node images as data
+// URIs — live in IndexedDB, because localStorage's ~5MB quota fits roughly two
+// generated images and this demo exists to keep many boards side by side.
+//
+// Key is versioned: records from before the board model cannot be rendered by the
+// current UI, so they are left behind rather than crashing the list.
+const INDEX_KEY = 'bd:boards:index:v2'
+const store = createStore('banana-decompose', 'boards')
 
-function readIndex(): RunMeta[] {
+function readIndex(): BoardMeta[] {
   if (typeof window === 'undefined') return []
   try {
     const raw = window.localStorage.getItem(INDEX_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
+    const parsed = raw ? JSON.parse(raw) : []
     return Array.isArray(parsed) ? parsed : []
   } catch {
     return []
   }
 }
 
-function writeIndex(index: RunMeta[]) {
+function writeIndex(index: BoardMeta[]) {
   try {
     window.localStorage.setItem(INDEX_KEY, JSON.stringify(index))
   } catch {
-    // Quota blown by thumbnails — drop the oldest thumbnails and retry once.
+    // Quota blown by thumbnails — keep the newest previews, drop the rest.
     const slim = index.map((m, i) => (i < 12 ? m : { ...m, thumbnail: undefined }))
     try {
       window.localStorage.setItem(INDEX_KEY, JSON.stringify(slim))
     } catch {
-      /* give up silently; IndexedDB still has the runs */
+      /* give up silently; IndexedDB still holds the boards */
     }
   }
 }
 
-export function listRuns(): RunMeta[] {
+export function listBoards(): BoardMeta[] {
   return readIndex().sort((a, b) => b.createdAt - a.createdAt)
 }
 
-export async function saveRun(run: Run) {
-  await set(`run:${run.id}`, run, store)
-  const { scene: _scene, steps: _steps, artifacts: _artifacts, ...meta } = run
-  const index = readIndex().filter((m) => m.id !== run.id)
+export async function saveBoard(board: Board) {
+  await set(`board:${board.id}`, board, store)
+  const { branches: _b, nodes: _n, ...meta } = board
+  const index = readIndex().filter((m) => m.id !== board.id)
   index.unshift(meta)
   writeIndex(index)
-  return meta as RunMeta
+  return meta as BoardMeta
 }
 
-export async function getRun(id: string): Promise<Run | undefined> {
-  return get<Run>(`run:${id}`, store)
+export async function getBoard(id: string): Promise<Board | undefined> {
+  return get<Board>(`board:${id}`, store)
 }
 
-export async function deleteRun(id: string) {
-  await del(`run:${id}`, store)
+export async function deleteBoard(id: string) {
+  await del(`board:${id}`, store)
   writeIndex(readIndex().filter((m) => m.id !== id))
 }
 
-export async function clearRuns() {
+export async function clearBoards() {
   await clear(store)
   writeIndex([])
 }
 
-export function newRunId() {
-  const rand = Math.random().toString(36).slice(2, 8)
-  return `${Date.now().toString(36)}-${rand}`
+export function newId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 }
 
 // ------------------------------------------------------------ settings

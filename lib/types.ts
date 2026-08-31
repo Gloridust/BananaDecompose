@@ -104,7 +104,7 @@ export type PipelineOptions = {
   decompose: DecomposeOptions
 }
 
-// ---------- Run records (history / comparison) ----------
+// ---------- Execution reporting ----------
 
 export type StepStatus = 'pending' | 'running' | 'ok' | 'error' | 'skipped'
 
@@ -116,25 +116,6 @@ export type RunStep = {
   cost?: number
   detail?: string
   error?: string
-}
-
-export type RunMeta = {
-  id: string
-  createdAt: number
-  pipeline: PipelineId
-  prompt: string
-  /** small JPEG data URI for the history list */
-  thumbnail?: string
-  layerCount: number
-  textLayerCount: number
-  totalMs: number
-  totalCost: number
-  options: ComposeOptions | DecomposeOptions
-  models: { image: string; vision: string; grounding: string }
-  failed?: boolean
-  metrics?: RunMetrics
-  /** Set when this run was one arm of a one-click benchmark sweep. */
-  benchmark?: BenchmarkRef
 }
 
 export type Artifact = {
@@ -163,18 +144,76 @@ export type RunMetrics = {
   l1: number | null
 }
 
-export type BenchmarkRef = {
+// ---------- Board: the playground canvas ----------
+//
+// Every generation — a single run or a full sweep — produces ONE board. Each
+// pipeline stage becomes a node, edges point from input to output, and a node
+// feeding several branches is drawn once. That makes the shared-upstream design
+// visible instead of merely documented: one plan node fanning out into three
+// matting chains is the argument for why the comparison is fair.
+
+export type NodeKind =
+  | 'prompt'    // the brief, root of everything
+  | 'plan'      // Scene JSON from the planner
+  | 'plate'     // background plate
+  | 'source'    // flat raster a decompose branch starts from
+  | 'analysis'  // layout read back off the pixels
+  | 'renders'   // raw element renders, grouped
+  | 'cuts'      // matted elements, grouped
+  | 'erase'     // reconstructed background
+  | 'scene'     // the assembled, editable result
+
+export type NodeStatus = 'running' | 'ok' | 'error' | 'skipped'
+
+export type BoardNode = {
   id: string
+  kind: NodeKind
   label: string
-  index: number
-  total: number
+  detail?: string
+  /** Branches this node feeds. More than one means it is shared upstream. */
+  branches: string[]
+  inputs: string[]
+  status: NodeStatus
+  ms?: number
+  cost?: number
+  error?: string
+  images?: { label: string; src: string }[]
+  scene?: Scene
+  metrics?: RunMetrics
+  /** Rendered summary for nodes whose payload is structured, not pixels. */
+  summary?: string
 }
 
-export type Run = RunMeta & {
-  scene: Scene
-  steps: RunStep[]
-  /** Raw intermediates, kept so the two pipelines can be inspected side by side. */
-  artifacts: Artifact[]
+export type BoardBranch = {
+  id: string
+  label: string
+  pipeline: PipelineId
+  options: ComposeOptions | DecomposeOptions
+  status: NodeStatus
+  metrics?: RunMetrics
+  sceneNodeId?: string
+  cost: number
+  ms: number
+  error?: string
+}
+
+export type BoardMeta = {
+  id: string
+  createdAt: number
+  prompt: string
+  thumbnail?: string
+  branchCount: number
+  nodeCount: number
+  totalMs: number
+  totalCost: number
+  models: { image: string; vision: string; grounding: string }
+  /** True when the decompose branches started from an uploaded raster. */
+  fromUpload?: boolean
+}
+
+export type Board = BoardMeta & {
+  branches: BoardBranch[]
+  nodes: BoardNode[]
 }
 
 // ---------- API wire types ----------

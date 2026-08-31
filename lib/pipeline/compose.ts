@@ -12,13 +12,29 @@ import type {
   UsageInfo,
 } from '../types'
 import { backgroundPrompt, elementPrompt } from '../prompts'
-import { boxToRect, checkCancelled, hexOr, mapLimit, skip, track, type PipelineCtx } from './shared'
+import { boxToRect, checkCancelled, emit, hexOr, mapLimit, skip, track, type PipelineCtx } from './shared'
 
 type GenRes = { images: string[]; usage: UsageInfo; model: string }
 
 const ELEMENT_CONCURRENCY = 2
+
 /** Grounding masks arrive as base64 text; a smaller frame is a smaller payload. */
 export const SEGMENT_INPUT_MAX_DIM = 768
+
+// A board holds at most one shared plan and one shared text-free plate, so those
+// get fixed node ids and merge across branches automatically. Everything else is
+// namespaced by branch.
+export const PROMPT_NODE = 'n:prompt'
+export const PLAN_NODE = 'n:plan'
+export const PLATE_NODE = 'n:plate'
+
+export type ComposeResult = {
+  scene: Scene
+  plan: ScenePlan
+  background: string
+  /** Board nodes the assembled scene descends from. */
+  tailNodes: string[]
+}
 
 /**
  * Pipeline A — "never flatten".
@@ -27,85 +43,144 @@ export const SEGMENT_INPUT_MAX_DIM = 768
  * backdrop, recover alpha locally, and keep type as real text nodes. Editability
  * is structural rather than recovered, so nothing has to be un-baked afterwards.
  */
-export type ComposeResult = { scene: Scene; plan: ScenePlan; background: string }
-
 export async function runCompose(
   ctx: PipelineCtx,
   prompt: string,
   opts: ComposeOptions,
   models: { image: string; vision: string; grounding: string },
-  /** Reuse upstream artefacts from an earlier arm so only the matting strategy
-   *  varies. The background plate is independent of how elements get matted, so
-   *  regenerating it per arm would only add cost and noise. */
+  /** Reuse upstream artefacts from an earlier branch so only the matting strategy
+   *  varies. The plate is independent of how elements get matted, so regenerating
+   *  it per branch would add cost and noise, nothing else. */
   shared?: { plan?: ScenePlan; background?: string },
 ): Promise<ComposeResult> {
   const { width, height } = aspectToSize(opts.aspectRatio, opts.resolution)
+  const B = ctx.branchId
 
   // 1 ── plan
   let plan: ScenePlan
   if (shared?.plan) {
-    skip(ctx, 'plan', '规划 Scene JSON', `复用上一轮的规划（${shared.plan.elements.length} 元素 / ${shared.plan.texts.length} 文字），保证只有抠图策略在变`)
-    plan = shared.plan
+    const reused = shared.plan
+    skip(ctx, 'plan', '规划 Scene JSON', `复用共享规划（${reused.elements.length} 元素 / ${reused.texts.length} 文字）`)
+    emit(ctx, {
+      id: PLAN_NODE,
+      kind: 'plan',
+      label: '规划 Scene JSON',
+      inputs: [PROMPT_NODE],
+      status: 'ok',
+      summary: planSummary(reused),
+    })
+    plan = reused
   } else {
-    plan = await track(ctx, 'plan', '规划 Scene JSON', async () => {
-      const res = await fetch('/api/plan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+    plan = await track(
+      ctx,
+      'plan',
+      '规划 Scene JSON',
+      async () => {
+        const json = await post('/api/plan', ctx, {
           prompt,
           width,
           height,
           maxElements: opts.maxElements,
           textStrategy: opts.text,
           model: opts.visionModel || undefined,
-        }),
-        signal: ctx.signal,
-      })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-      const p = json.plan as ScenePlan
-      return {
-        value: p,
-        usage: json.usage as UsageInfo,
-        detail: `${p.elements.length} 个元素 · ${p.texts.length} 段文字`,
-      }
-    })
+        })
+        const p = json.plan as ScenePlan
+        return {
+          value: p,
+          usage: json.usage as UsageInfo,
+          detail: `${p.elements.length} 个元素 · ${p.texts.length} 段文字`,
+          summary: planSummary(p),
+        }
+      },
+      { id: PLAN_NODE, kind: 'plan', inputs: [PROMPT_NODE] },
+    )
   }
 
   const bakeText = opts.text === 'baked'
+  // The baked arm renders copy into its plate, so it cannot share one.
+  const plateNode = bakeText ? `n:${B}:plate` : PLATE_NODE
 
-  // 2 ── background plate. Shareable only when text stays out of the raster —
-  // the baked arm needs its own plate with the copy rendered in.
+  // 2 ── background plate
   let bgSrc: string
   if (shared?.background && !bakeText) {
-    skip(ctx, 'background', '生成背景板', '复用上一轮的背景板 —— 抠图策略不影响背景')
+    skip(ctx, 'background', '生成背景板', '复用共享背景板 —— 抠图策略不影响背景')
     bgSrc = shared.background
     ctx.onArtifact({ label: '背景板（复用）', src: bgSrc, role: 'plate' })
-  } else {
-    bgSrc = await track(ctx, 'background', bakeText ? '生成背景（文字烘焙进像素）' : '生成背景板', async () => {
-      const basePrompt = backgroundPrompt(plan.background.prompt)
-      const withCopy = bakeText && plan.texts.length
-        ? `${plan.background.prompt}\n\nRender this copy into the artwork, crisply and legibly, laid out as described:\n${plan.texts
-            .map((t) => `- "${t.content}" (${t.fontFamily} ${t.fontWeight}, ${t.color})`)
-            .join('\n')}`
-        : basePrompt
-
-      const json = await gen(ctx, {
-        prompt: withCopy,
-        aspectRatio: opts.aspectRatio,
-        resolution: opts.resolution,
-        model: models.image,
-      })
-      ctx.onArtifact({ label: '背景板', src: json.images[0], role: 'plate' })
-      return { value: json.images[0], usage: json.usage }
+    emit(ctx, {
+      id: plateNode,
+      kind: 'plate',
+      label: '背景板',
+      detail: '复用共享背景板',
+      inputs: [PLAN_NODE],
+      status: 'ok',
+      images: [{ label: '背景板', src: bgSrc }],
     })
+  } else {
+    bgSrc = await track(
+      ctx,
+      'background',
+      bakeText ? '生成背景（文字烘焙进像素）' : '生成背景板',
+      async () => {
+        const copy = plan.texts
+          .map((t) => `- "${t.content}" (${t.fontFamily} ${t.fontWeight}, ${t.color})`)
+          .join('\n')
+        const withCopy =
+          bakeText && plan.texts.length
+            ? `${plan.background.prompt}\n\nRender this copy into the artwork, crisply and legibly, laid out as described:\n${copy}`
+            : backgroundPrompt(plan.background.prompt)
+
+        const json = await gen(ctx, {
+          prompt: withCopy,
+          aspectRatio: opts.aspectRatio,
+          resolution: opts.resolution,
+          model: models.image,
+        })
+        ctx.onArtifact({ label: '背景板', src: json.images[0], role: 'plate' })
+        return { value: json.images[0], usage: json.usage, images: [{ label: '背景板', src: json.images[0] }] }
+      },
+      { id: plateNode, kind: 'plate', inputs: [PLAN_NODE] },
+    )
   }
 
   // 3 ── elements, each rendered alone then matted
+  const rendersNode = `n:${B}:renders`
+  const cutsNode = `n:${B}:cuts`
+  const rawShots: { label: string; src: string }[] = []
+  const cutShots: { label: string; src: string }[] = []
+
+  const pushRaw = (label: string, src: string) => {
+    rawShots.push({ label, src })
+    emit(ctx, {
+      id: rendersNode,
+      kind: 'renders',
+      label: `独立渲染 ×${plan.elements.length}`,
+      detail: backdropLabel(opts.matte),
+      inputs: [PLAN_NODE],
+      status: 'running',
+      images: [...rawShots],
+    })
+  }
+
+  emit(ctx, {
+    id: rendersNode,
+    kind: 'renders',
+    label: `独立渲染 ×${plan.elements.length}`,
+    detail: backdropLabel(opts.matte),
+    inputs: [PLAN_NODE],
+    status: 'running',
+  })
+  emit(ctx, {
+    id: cutsNode,
+    kind: 'cuts',
+    label: `抠图 ×${plan.elements.length}`,
+    detail: matteLabel(opts.matte),
+    inputs: [rendersNode],
+    status: 'running',
+  })
+
   const elementLayers = await mapLimit(plan.elements, ELEMENT_CONCURRENCY, async (el, i) => {
-    const stepId = `el-${el.id}`
     try {
-      return await track(ctx, stepId, `元素 ${i + 1}/${plan.elements.length}：${el.name}`, async () => {
+      return await track(ctx, `el-${el.id}`, `元素 ${i + 1}/${plan.elements.length}：${el.name}`, async () => {
         const usage: UsageInfo = { cost: 0 }
         let matte: MatteResult
         let degraded: string | null = null
@@ -118,16 +193,21 @@ export async function runCompose(
           usage.cost = white.usage.cost + black.usage.cost
           ctx.onArtifact({ label: `${el.name} · 白底`, src: white.images[0], role: 'raw' })
           ctx.onArtifact({ label: `${el.name} · 黑底`, src: black.images[0], role: 'raw' })
+          pushRaw(`${el.name} · 白底`, white.images[0])
+          pushRaw(`${el.name} · 黑底`, black.images[0])
           matte = await dualRenderMatte(white.images[0], black.images[0])
         } else if (opts.matte === 'chroma') {
           const res = await gen(ctx, { prompt: elementPrompt(el.prompt, 'magenta'), aspectRatio: '1:1', resolution: opts.resolution, model: models.image, seed: 1000 + i })
           usage.cost = res.usage.cost
           ctx.onArtifact({ label: `${el.name} · 品红底`, src: res.images[0], role: 'raw' })
+          pushRaw(`${el.name} · 品红底`, res.images[0])
           matte = await chromaKeyMatte(res.images[0])
         } else {
           const res = await gen(ctx, { prompt: elementPrompt(el.prompt, 'grey'), aspectRatio: '1:1', resolution: opts.resolution, model: models.image, seed: 1000 + i })
           usage.cost = res.usage.cost
           ctx.onArtifact({ label: `${el.name} · 灰底`, src: res.images[0], role: 'raw' })
+          pushRaw(`${el.name} · 灰底`, res.images[0])
+
           const seg = await segment(ctx, res.images[0], el.name, models.grounding)
           usage.cost += seg.usage?.cost ?? 0
           matte = seg.mask
@@ -137,6 +217,16 @@ export async function runCompose(
         }
 
         ctx.onArtifact({ label: `${el.name} · 抠图结果`, src: matte.src, role: 'cut' })
+        cutShots.push({ label: el.name, src: matte.src })
+        emit(ctx, {
+          id: cutsNode,
+          kind: 'cuts',
+          label: `抠图 ×${plan.elements.length}`,
+          detail: matteLabel(opts.matte),
+          inputs: [rendersNode],
+          status: 'running',
+          images: [...cutShots],
+        })
 
         const target = boxToRect(el.box, width, height)
         const size = await imageSize(matte.src)
@@ -156,55 +246,95 @@ export async function runCompose(
           provenance: `独立渲染 · ${opts.matte} · 覆盖率 ${(matte.coverage * 100).toFixed(0)}%`,
         }
 
-        return {
-          value: layer,
-          usage,
-          detail: degraded ? `覆盖率 ${(matte.coverage * 100).toFixed(0)}% · ${degraded}` : `覆盖率 ${(matte.coverage * 100).toFixed(0)}%`,
-        }
+        const pct = `${(matte.coverage * 100).toFixed(0)}%`
+        return { value: layer, usage, detail: degraded ? `覆盖率 ${pct} · ${degraded}` : `覆盖率 ${pct}` }
       })
     } catch (err) {
       if ((err as Error).name === 'Cancelled') throw err
-      return null // one bad element must not sink the whole run
+      return null // one bad element must not sink the whole branch
     }
   })
 
   checkCancelled(ctx)
 
+  emit(ctx, {
+    id: rendersNode,
+    kind: 'renders',
+    label: `独立渲染 ×${plan.elements.length}`,
+    detail: backdropLabel(opts.matte),
+    inputs: [PLAN_NODE],
+    status: 'ok',
+    images: [...rawShots],
+  })
+  emit(ctx, {
+    id: cutsNode,
+    kind: 'cuts',
+    label: `抠图 ×${plan.elements.length}`,
+    detail: matteLabel(opts.matte),
+    inputs: [rendersNode],
+    status: 'ok',
+    images: [...cutShots],
+  })
+
   // 4 ── type
   let textLayers: TextLayer[] = []
   let backgroundSrc = bgSrc
+  const tailNodes = [plateNode, cutsNode]
 
   if (!bakeText) {
     skip(ctx, 'text', '文字层', '直接使用规划里的文本节点，未经过任何像素往返')
     textLayers = plan.texts.map((t) => planTextToLayer(t, width, height))
   } else {
-    const recovered = await track(ctx, 'ocr', 'OCR 回收烘焙的文字', async () => {
-      const res = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: bgSrc, width, height, maxElements: 1, model: opts.visionModel || undefined }),
-        signal: ctx.signal,
-      })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-      const a = json.analysis as SceneAnalysis
-      return { value: a.texts, usage: json.usage as UsageInfo, detail: `识别出 ${a.texts.length} 段` }
-    })
+    const ocrNode = `n:${B}:ocr`
+    const recovered = await track(
+      ctx,
+      'ocr',
+      'OCR 回收烘焙的文字',
+      async () => {
+        const json = await post('/api/analyze', ctx, {
+          image: bgSrc,
+          width,
+          height,
+          maxElements: 1,
+          model: opts.visionModel || undefined,
+        })
+        const a = json.analysis as SceneAnalysis
+        return {
+          value: a.texts,
+          usage: json.usage as UsageInfo,
+          detail: `识别出 ${a.texts.length} 段`,
+          summary: a.texts.map((t) => `「${t.content}」 ${t.fontFamily} ${t.fontWeight}`).join('\n') || '没识别出文字',
+        }
+      },
+      { id: ocrNode, kind: 'analysis', inputs: [plateNode] },
+    )
 
-    backgroundSrc = await track(ctx, 'erase', '擦除文字，重建背景', async () => {
-      const res = await fetch('/api/erase', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: bgSrc, targets: [], aspectRatio: opts.aspectRatio, resolution: opts.resolution, model: models.image }),
-        signal: ctx.signal,
-      })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-      ctx.onArtifact({ label: '擦除后的背景板', src: json.image, role: 'plate' })
-      return { value: json.image as string, usage: json.usage as UsageInfo }
-    })
+    const eraseNode = `n:${B}:erase`
+    backgroundSrc = await track(
+      ctx,
+      'erase',
+      '擦除文字，重建背景',
+      async () => {
+        const json = await post('/api/erase', ctx, {
+          image: bgSrc,
+          targets: [],
+          aspectRatio: opts.aspectRatio,
+          resolution: opts.resolution,
+          model: models.image,
+        })
+        ctx.onArtifact({ label: '擦除后的背景板', src: json.image, role: 'plate' })
+        return {
+          value: json.image as string,
+          usage: json.usage as UsageInfo,
+          images: [{ label: '擦除后的背景板', src: json.image }],
+        }
+      },
+      { id: eraseNode, kind: 'erase', inputs: [plateNode, ocrNode] },
+    )
 
     textLayers = recovered.map((t, i) => analysisTextToLayer(t, width, height, i))
+    tailNodes[0] = eraseNode
+    tailNodes.push(ocrNode)
   }
 
   const background: ImageLayer = {
@@ -234,16 +364,14 @@ export async function runCompose(
     },
     plan,
     background: bgSrc,
+    tailNodes,
   }
 }
 
 // ------------------------------------------------------------- helpers
 
-async function gen(
-  ctx: PipelineCtx,
-  body: { prompt: string; aspectRatio?: string; resolution?: string; model?: string; seed?: number; background?: 'transparent' },
-): Promise<GenRes> {
-  const res = await fetch('/api/generate', {
+async function post(path: string, ctx: PipelineCtx, body: unknown) {
+  const res = await fetch(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -251,7 +379,14 @@ async function gen(
   })
   const json = await res.json()
   if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-  return json as GenRes
+  return json
+}
+
+async function gen(
+  ctx: PipelineCtx,
+  body: { prompt: string; aspectRatio?: string; resolution?: string; model?: string; seed?: number },
+): Promise<GenRes> {
+  return (await post('/api/generate', ctx, body)) as GenRes
 }
 
 export type SegmentResult = {
@@ -267,15 +402,21 @@ export type SegmentResult = {
  *  as base64 text, so a smaller frame is a directly smaller — and faster — payload. */
 export async function segment(ctx: PipelineCtx, image: string, label: string, model: string): Promise<SegmentResult> {
   const small = await downscale(image, SEGMENT_INPUT_MAX_DIM)
-  const res = await fetch('/api/segment', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ image: small, label, model }),
-    signal: ctx.signal,
-  })
-  const json = await res.json()
-  if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-  return json as SegmentResult
+  return (await post('/api/segment', ctx, { image: small, label, model })) as SegmentResult
+}
+
+function planSummary(p: ScenePlan) {
+  const els = p.elements.map((e) => `· ${e.name}`).join('\n')
+  const txt = p.texts.map((t) => `「${t.content}」`).join('  ')
+  return [`背景：${p.background.prompt.slice(0, 60)}…`, els, txt].filter(Boolean).join('\n')
+}
+
+function backdropLabel(m: ComposeOptions['matte']) {
+  return m === 'dual' ? '白底 + 黑底，每个元素两张' : m === 'chroma' ? '品红底，每个元素一张' : '灰底，每个元素一张'
+}
+
+function matteLabel(m: ComposeOptions['matte']) {
+  return m === 'dual' ? '差值解 alpha' : m === 'chroma' ? '色距抠除 + 去色溢' : 'VLM 掩码'
 }
 
 /** Scale a subject into its planned box without distorting it. */

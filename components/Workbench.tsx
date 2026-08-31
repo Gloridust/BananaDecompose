@@ -3,27 +3,28 @@
 import Link from 'next/link'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Controls, { DEFAULT_SETTINGS, type Settings } from './Controls'
-import Stage from './Stage'
-import { ArtifactStrip, Inspector, LayerList, Section, StepLog } from './Panels'
+import BoardCanvas from './Board'
+import BranchLegend from './BranchLegend'
+import SceneEditor from './SceneEditor'
 import BenchmarkPanel from './BenchmarkPanel'
-import { MetricRow } from './Metrics'
-import { download, downloadJson, downloadSvg, sceneToPng } from '@/lib/export'
-import { getRun, loadSettings, newRunId, saveRun, saveSettings } from '@/lib/history'
+import { ArtifactStrip, StepLog } from './Panels'
+import { PROMPT_NODE, runCompose } from '@/lib/pipeline/compose'
+import { runDecompose } from '@/lib/pipeline/decompose'
+import { getBoard, listBoards, loadSettings, newId, saveBoard, saveSettings } from '@/lib/history'
 import { computeMetrics } from '@/lib/metrics'
 import { fileToDataUrl, thumbnail } from '@/lib/matte'
-import { runCompose } from '@/lib/pipeline/compose'
-import { runDecompose } from '@/lib/pipeline/decompose'
-import type { PipelineCtx } from '@/lib/pipeline/shared'
-import { DEFAULT_SELECTION, VARIANTS, resolveOptions } from '@/lib/benchmark'
+import { sceneToPng } from '@/lib/export'
+import { VARIANTS, resolveOptions } from '@/lib/benchmark'
+import { DEFAULT_SELECTION } from '@/lib/benchmark'
+import type { NodeEmit, PipelineCtx } from '@/lib/pipeline/shared'
 import type {
   Artifact,
-  BenchmarkRef,
+  Board,
+  BoardBranch,
+  BoardNode,
   ComposeOptions,
   DecomposeOptions,
-  Layer,
   PipelineId,
-  Run,
-  RunMetrics,
   RunStep,
   Scene,
   ScenePlan,
@@ -31,59 +32,48 @@ import type {
 
 type Models = { image: string; vision: string; grounding: string }
 
-type RunConfig = {
+type BranchPlan = {
+  id: string
+  label: string
   pipeline: PipelineId
-  prompt: string
   compose: ComposeOptions
   decompose: DecomposeOptions
-  sourceImage?: string
-  shared?: { plan?: ScenePlan; background?: string }
-  benchmark?: BenchmarkRef
-}
-
-type RunOutcome = {
-  scene: Scene | null
-  plan?: ScenePlan
-  background?: string
-  source?: string
-  metrics?: RunMetrics
 }
 
 export default function Workbench() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS)
   const [hydrated, setHydrated] = useState(false)
-  const [scene, setScene] = useState<Scene | null>(null)
+  const [board, setBoard] = useState<Board | null>(null)
   const [steps, setSteps] = useState<RunStep[]>([])
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
-  const [metrics, setMetrics] = useState<RunMetrics | null>(null)
   const [running, setRunning] = useState(false)
-  const [benchProgress, setBenchProgress] = useState<{ label: string; index: number; total: number } | null>(null)
-  const [benchDone, setBenchDone] = useState<string | null>(null)
+  const [progress, setProgress] = useState<{ label: string; index: number; total: number } | null>(null)
   const [selection, setSelection] = useState<string[]>(DEFAULT_SELECTION)
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [hiddenBranches, setHiddenBranches] = useState<Set<string>>(new Set())
+  const [hiddenNodes, setHiddenNodes] = useState<Set<string>>(new Set())
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
+  const [editing, setEditing] = useState<string | null>(null)
   const [sourceImage, setSourceImage] = useState<string | null>(null)
-  const [showOutlines, setShowOutlines] = useState(true)
-  const [totals, setTotals] = useState({ cost: 0, ms: 0 })
   const [models, setModels] = useState<Models | null>(null)
   const [configured, setConfigured] = useState<boolean | null>(null)
   const [error, setError] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
+  // The board is mutated at high frequency while running; a ref avoids losing
+  // node updates to React batching between concurrent element renders.
+  const boardRef = useRef<Board | null>(null)
 
   useEffect(() => {
     setSettings(loadSettings(DEFAULT_SETTINGS))
     setHydrated(true)
 
-    // Deep link from the history page: /?run=<id> reopens a past run for editing.
-    const runId = new URLSearchParams(window.location.search).get('run')
-    if (runId) {
-      getRun(runId).then((prev) => {
+    const boardId = new URLSearchParams(window.location.search).get('board')
+    const target = boardId ?? listBoards()[0]?.id
+    if (target) {
+      getBoard(target).then((prev) => {
         if (!prev) return
-        setScene(prev.scene)
-        setSteps(prev.steps)
-        setArtifacts(prev.artifacts)
-        setMetrics(prev.metrics ?? null)
-        setTotals({ cost: prev.totalCost, ms: prev.totalMs })
-        setSettings((cur) => ({ ...cur, pipeline: prev.pipeline, prompt: prev.prompt }))
+        boardRef.current = prev
+        setBoard(prev)
+        setSettings((cur) => ({ ...cur, prompt: prev.prompt }))
       })
     }
 
@@ -100,219 +90,317 @@ export default function Workbench() {
     if (hydrated) saveSettings(settings)
   }, [settings, hydrated])
 
-  const patchSettings = useCallback((patch: Partial<Settings>) => {
-    setSettings((prev) => ({ ...prev, ...patch }))
+  const patchSettings = useCallback((patch: Partial<Settings>) => setSettings((p) => ({ ...p, ...patch })), [])
+
+  const commit = useCallback((next: Board) => {
+    boardRef.current = next
+    setBoard(next)
   }, [])
 
-  // ----------------------------------------------------- one execution
+  // ------------------------------------------------------- board writes
 
-  const executeRun = useCallback(
-    async (cfg: RunConfig, signal: AbortSignal): Promise<RunOutcome> => {
-      if (!models) return { scene: null }
+  const upsertNode = useCallback(
+    (branchId: string, emitted: NodeEmit) => {
+      const cur = boardRef.current
+      if (!cur) return
+      const nodes = [...cur.nodes]
+      const i = nodes.findIndex((n) => n.id === emitted.id)
+      if (i === -1) {
+        nodes.push({ ...emitted, branches: [branchId] })
+      } else {
+        const prev = nodes[i]
+        nodes[i] = {
+          ...prev,
+          ...emitted,
+          // A shared node accumulates every branch that consumed it.
+          branches: prev.branches.includes(branchId) ? prev.branches : [...prev.branches, branchId],
+          // Never let a later reuse blank out payload the first producer supplied.
+          images: emitted.images ?? prev.images,
+          summary: emitted.summary ?? prev.summary,
+          scene: emitted.scene ?? prev.scene,
+          metrics: emitted.metrics ?? prev.metrics,
+          cost: (prev.cost ?? 0) + (emitted.cost ?? 0) || undefined,
+        }
+      }
+      commit({ ...cur, nodes })
+    },
+    [commit],
+  )
 
-      setError(null)
-      setSteps([])
-      setArtifacts([])
-      setScene(null)
-      setMetrics(null)
-      setSelectedId(null)
-      setTotals({ cost: 0, ms: 0 })
+  const patchBranch = useCallback(
+    (branchId: string, patch: Partial<BoardBranch>) => {
+      const cur = boardRef.current
+      if (!cur) return
+      commit({ ...cur, branches: cur.branches.map((b) => (b.id === branchId ? { ...b, ...patch } : b)) })
+    },
+    [commit],
+  )
+
+  // ---------------------------------------------------- run one branch
+
+  const runBranch = useCallback(
+    async (
+      plan: BranchPlan,
+      shared: { plan?: ScenePlan; background?: string; source?: string },
+      signal: AbortSignal,
+    ) => {
+      if (!models) return shared
 
       const collected: RunStep[] = []
       const collectedArtifacts: Artifact[] = []
-      const runTotals = { cost: 0, ms: 0 }
+      const branchTotals = { cost: 0, ms: 0 }
 
       const ctx: PipelineCtx = {
         signal,
-        totals: runTotals,
+        branchId: plan.id,
+        totals: branchTotals,
         onStep: (step) => {
           const i = collected.findIndex((s) => s.id === step.id)
           if (i === -1) collected.push(step)
           else collected[i] = step
           setSteps([...collected])
-          setTotals({ ...runTotals })
         },
         onArtifact: (a) => {
           collectedArtifacts.push(a)
           setArtifacts([...collectedArtifacts])
         },
+        onNode: (n) => upsertNode(plan.id, n),
       }
 
+      patchBranch(plan.id, { status: 'running' })
       const startedAt = performance.now()
-      const outcome: RunOutcome = { scene: null }
-      let failed = false
+      const next = { ...shared }
 
       try {
-        if (cfg.pipeline === 'compose') {
-          const res = await runCompose(ctx, cfg.prompt, cfg.compose, models, cfg.shared)
-          outcome.scene = res.scene
-          outcome.plan = res.plan
-          outcome.background = res.background
-        } else {
-          const res = await runDecompose(ctx, { prompt: cfg.prompt, sourceImage: cfg.sourceImage }, cfg.decompose, models)
-          outcome.scene = res.scene
-          outcome.source = res.source
-        }
-        setScene(outcome.scene)
-      } catch (err) {
-        failed = true
-        if ((err as Error).name !== 'Cancelled') setError((err as Error).message)
-      }
+        let scene: Scene
+        let tailNodes: string[]
 
-      if (outcome.scene) {
-        try {
-          outcome.metrics = await computeMetrics(outcome.scene, collectedArtifacts, {
-            matte: cfg.pipeline === 'compose' ? cfg.compose.matte : undefined,
-            liveText: cfg.pipeline === 'compose' && cfg.compose.text === 'live',
+        if (plan.pipeline === 'compose') {
+          const res = await runCompose(ctx, settings.prompt, plan.compose, models, {
+            plan: shared.plan,
+            background: shared.background,
           })
-          setMetrics(outcome.metrics)
-        } catch {
-          /* metrics are diagnostics, never a reason to lose the scene */
+          scene = res.scene
+          tailNodes = res.tailNodes
+          if (!next.plan) next.plan = res.plan
+          // Only a text-free plate is reusable; the baked arm bakes copy into its own.
+          if (!next.background && plan.compose.text === 'live') next.background = res.background
+        } else {
+          const res = await runDecompose(
+            ctx,
+            { prompt: settings.prompt, sourceImage: shared.source },
+            plan.decompose,
+            models,
+          )
+          scene = res.scene
+          tailNodes = res.tailNodes
+          if (!next.source) next.source = res.source
         }
 
-        try {
-          const flattened = await sceneToPng(outcome.scene)
-          const record: Run = {
-            id: newRunId(),
-            createdAt: Date.now(),
-            pipeline: cfg.pipeline,
-            prompt: cfg.sourceImage && cfg.pipeline === 'decompose' ? `${cfg.prompt} (上传图)` : cfg.prompt,
-            thumbnail: await thumbnail(flattened, 400),
-            layerCount: outcome.scene.layers.length,
-            textLayerCount: outcome.scene.layers.filter((l) => l.type === 'text').length,
-            totalMs: Math.round(performance.now() - startedAt),
-            totalCost: runTotals.cost,
-            options: cfg.pipeline === 'compose' ? cfg.compose : cfg.decompose,
-            models,
-            failed,
-            metrics: outcome.metrics,
-            benchmark: cfg.benchmark,
-            scene: outcome.scene,
-            steps: collected,
-            artifacts: collectedArtifacts,
-          }
-          await saveRun(record)
-        } catch {
-          /* history is a convenience, never block the result on it */
-        }
+        const metrics = await computeMetrics(scene, collectedArtifacts, {
+          matte: plan.pipeline === 'compose' ? plan.compose.matte : undefined,
+          liveText: plan.pipeline === 'compose' && plan.compose.text === 'live',
+        }).catch(() => undefined)
+
+        const sceneNodeId = `n:${plan.id}:scene`
+        const flattened = await sceneToPng(scene)
+        upsertNode(plan.id, {
+          id: sceneNodeId,
+          kind: 'scene',
+          label: plan.label,
+          detail: `${scene.layers.length} 层 · ${scene.layers.filter((l) => l.type === 'text').length} 文字`,
+          inputs: tailNodes,
+          status: 'ok',
+          ms: Math.round(performance.now() - startedAt),
+          scene,
+          metrics,
+          images: [{ label: '合成结果', src: await thumbnail(flattened, 420) }],
+        })
+
+        patchBranch(plan.id, {
+          status: 'ok',
+          metrics,
+          sceneNodeId,
+          cost: branchTotals.cost,
+          ms: Math.round(performance.now() - startedAt),
+        })
+      } catch (err) {
+        const message = (err as Error).message
+        const cancelled = (err as Error).name === 'Cancelled'
+        if (!cancelled) setError(message)
+        patchBranch(plan.id, {
+          status: cancelled ? 'skipped' : 'error',
+          error: cancelled ? undefined : message,
+          cost: branchTotals.cost,
+          ms: Math.round(performance.now() - startedAt),
+        })
+        if (cancelled) throw err
       }
 
-      return outcome
+      const cur = boardRef.current
+      if (cur) {
+        commit({
+          ...cur,
+          totalCost: cur.branches.reduce((a, b) => a + b.cost, 0),
+          totalMs: cur.branches.reduce((a, b) => a + b.ms, 0),
+          nodeCount: cur.nodes.length,
+        })
+      }
+
+      return next
     },
-    [models],
+    [models, settings.prompt, upsertNode, patchBranch, commit],
   )
 
-  // ------------------------------------------------------------- run
+  // ------------------------------------------------- run a whole board
 
-  const run = useCallback(async () => {
-    const controller = new AbortController()
-    abortRef.current = controller
-    setRunning(true)
-    setBenchDone(null)
-    try {
-      await executeRun(
-        {
-          pipeline: settings.pipeline,
-          prompt: settings.prompt,
-          compose: settings.compose,
-          decompose: settings.decompose,
-          sourceImage: sourceImage ?? undefined,
-        },
-        controller.signal,
-      )
-    } finally {
-      setRunning(false)
-      abortRef.current = null
-    }
-  }, [executeRun, settings, sourceImage])
+  const runBoard = useCallback(
+    async (plans: BranchPlan[]) => {
+      if (!models || !plans.length) return
+      const controller = new AbortController()
+      abortRef.current = controller
+      setRunning(true)
+      setError(null)
+      setSteps([])
+      setArtifacts([])
+      setHiddenBranches(new Set())
+      setHiddenNodes(new Set())
+      setSelectedNodeId(null)
 
-  // ------------------------------------------------------- benchmark
-
-  const runBenchmark = useCallback(async () => {
-    const arms = VARIANTS.filter((v) => selection.includes(v.id))
-    if (!arms.length) return
-
-    const controller = new AbortController()
-    abortRef.current = controller
-    setRunning(true)
-    setBenchDone(null)
-
-    const benchmarkId = newRunId()
-    // Held constant across arms of the same pipeline so each row differs by one thing.
-    let sharedPlan: ScenePlan | undefined
-    let sharedBackground: string | undefined
-    let sharedSource: string | undefined = sourceImage ?? undefined
-    let completed = 0
-
-    try {
-      for (let i = 0; i < arms.length; i++) {
-        if (controller.signal.aborted) break
-        const arm = arms[i]
-        setBenchProgress({ label: arm.label, index: i + 1, total: arms.length })
-
-        const opts = resolveOptions(arm, { compose: settings.compose, decompose: settings.decompose })
-        const outcome = await executeRun(
+      const fresh: Board = {
+        id: newId(),
+        createdAt: Date.now(),
+        prompt: settings.prompt,
+        branchCount: plans.length,
+        nodeCount: 0,
+        totalMs: 0,
+        totalCost: 0,
+        models,
+        fromUpload: Boolean(sourceImage),
+        branches: plans.map((p) => ({
+          id: p.id,
+          label: p.label,
+          pipeline: p.pipeline,
+          options: p.pipeline === 'compose' ? p.compose : p.decompose,
+          status: 'skipped',
+          cost: 0,
+          ms: 0,
+        })),
+        nodes: [
           {
-            pipeline: arm.pipeline,
-            prompt: settings.prompt,
-            compose: opts.compose,
-            decompose: opts.decompose,
-            sourceImage: arm.pipeline === 'decompose' ? sharedSource : undefined,
-            shared: arm.pipeline === 'compose' ? { plan: sharedPlan, background: sharedBackground } : undefined,
-            benchmark: { id: benchmarkId, label: arm.label, index: i + 1, total: arms.length },
+            id: PROMPT_NODE,
+            kind: 'prompt',
+            label: '提示词',
+            branches: [],
+            inputs: [],
+            status: 'ok',
+            summary: settings.prompt,
           },
-          controller.signal,
-        )
-
-        if (outcome.plan && !sharedPlan) sharedPlan = outcome.plan
-        // Only a text-free plate is reusable; the baked arm bakes copy into its own.
-        if (outcome.background && !sharedBackground && opts.compose.text === 'live') {
-          sharedBackground = outcome.background
-        }
-        if (outcome.source && !sharedSource) sharedSource = outcome.source
-        if (outcome.scene) completed++
+        ],
       }
-      if (completed) setBenchDone(benchmarkId)
-    } finally {
-      setRunning(false)
-      setBenchProgress(null)
-      abortRef.current = null
-    }
-  }, [executeRun, selection, settings, sourceImage])
+      commit(fresh)
+
+      let shared: { plan?: ScenePlan; background?: string; source?: string } = {
+        source: sourceImage ?? undefined,
+      }
+
+      try {
+        for (let i = 0; i < plans.length; i++) {
+          if (controller.signal.aborted) break
+          setProgress({ label: plans[i].label, index: i + 1, total: plans.length })
+          shared = await runBranch(plans[i], shared, controller.signal)
+        }
+      } catch {
+        /* cancellation already recorded on the branch */
+      } finally {
+        setRunning(false)
+        setProgress(null)
+        abortRef.current = null
+      }
+
+      const done = boardRef.current
+      if (done) {
+        const sceneNode = done.nodes.find((n) => n.kind === 'scene' && n.images?.length)
+        const finished: Board = { ...done, thumbnail: sceneNode?.images?.[0]?.src, nodeCount: done.nodes.length }
+        commit(finished)
+        await saveBoard(finished).catch(() => undefined)
+      }
+    },
+    [models, settings.prompt, sourceImage, commit, runBranch],
+  )
+
+  const runSingle = useCallback(() => {
+    const pipeline = settings.pipeline
+    return runBoard([
+      {
+        id: 'single',
+        label: pipeline === 'compose' ? `A · ${settings.compose.matte}` : `B · ${settings.decompose.useMasks ? '掩码' : 'bbox'}`,
+        pipeline,
+        compose: settings.compose,
+        decompose: settings.decompose,
+      },
+    ])
+  }, [runBoard, settings])
+
+  const runBenchmark = useCallback(() => {
+    const arms = VARIANTS.filter((v) => selection.includes(v.id))
+    return runBoard(
+      arms.map((arm) => {
+        const opts = resolveOptions(arm, { compose: settings.compose, decompose: settings.decompose })
+        return { id: arm.id, label: arm.label, pipeline: arm.pipeline, compose: opts.compose, decompose: opts.decompose }
+      }),
+    )
+  }, [runBoard, selection, settings])
 
   const cancel = useCallback(() => abortRef.current?.abort(), [])
 
-  // ---------------------------------------------------------- editing
+  // ------------------------------------------------------------- edit
 
-  const updateLayer = useCallback((id: string, patch: Partial<Layer>) => {
-    setScene((prev) =>
-      prev ? { ...prev, layers: prev.layers.map((l) => (l.id === id ? ({ ...l, ...patch } as Layer) : l)) } : prev,
-    )
-  }, [])
+  const editingNode = useMemo(
+    () => (editing ? (board?.nodes.find((n) => n.id === editing) ?? null) : null),
+    [editing, board],
+  )
 
-  const reorderLayer = useCallback((id: string, dir: -1 | 1) => {
-    setScene((prev) => {
-      if (!prev) return prev
-      const i = prev.layers.findIndex((l) => l.id === id)
-      const j = i + dir
-      if (i === -1 || j < 0 || j >= prev.layers.length) return prev
-      const layers = [...prev.layers]
-      ;[layers[i], layers[j]] = [layers[j], layers[i]]
-      return { ...prev, layers }
+  const saveSceneEdit = useCallback(
+    async (nodeId: string, scene: Scene) => {
+      const cur = boardRef.current
+      if (!cur) return
+      const next: Board = { ...cur, nodes: cur.nodes.map((n) => (n.id === nodeId ? { ...n, scene } : n)) }
+      commit(next)
+      await saveBoard(next).catch(() => undefined)
+    },
+    [commit],
+  )
+
+  const toggleBranch = useCallback((id: string) => {
+    setHiddenBranches((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
     })
   }, [])
 
-  const deleteLayer = useCallback((id: string) => {
-    setScene((prev) => (prev ? { ...prev, layers: prev.layers.filter((l) => l.id !== id) } : prev))
-    setSelectedId((cur) => (cur === id ? null : cur))
+  const soloBranch = useCallback(
+    (id: string) => {
+      const others = (board?.branches ?? []).filter((b) => b.id !== id).map((b) => b.id)
+      setHiddenBranches((prev) => (prev.size === others.length && others.every((o) => prev.has(o)) ? new Set() : new Set(others)))
+    },
+    [board],
+  )
+
+  const toggleNode = useCallback((id: string) => {
+    setHiddenNodes((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
   }, [])
 
-  const selected = useMemo(() => scene?.layers.find((l) => l.id === selectedId) ?? null, [scene, selectedId])
-
-  const exportPng = useCallback(async () => {
-    if (!scene) return
-    download(`banana-${Date.now()}.png`, await sceneToPng(scene))
-  }, [scene])
+  const openScene = useCallback((node: BoardNode) => {
+    if (node.scene) setEditing(node.id)
+  }, [])
 
   // -------------------------------------------------------------- ui
 
@@ -322,15 +410,15 @@ export default function Workbench() {
         <h1 className="font-mono text-sm font-semibold tracking-tight">
           <span className="text-banana-400">Banana</span>Decompose
         </h1>
-        <p className="hidden text-[11px] text-ink-400 md:block">Nano Banana 2 → 可编辑图层 + 真实文字</p>
+        <p className="hidden text-[11px] text-ink-400 md:block">节点画布 · 每条分支的每个中间产物</p>
         <div className="flex-1" />
-        {totals.cost > 0 || totals.ms > 0 ? (
-          <span className="font-mono text-[10px] tabular-nums text-ink-400">
-            ${totals.cost.toFixed(4)} · {(totals.ms / 1000).toFixed(1)}s
-          </span>
+        {hiddenNodes.size ? (
+          <button onClick={() => setHiddenNodes(new Set())} className="font-mono text-[10px] text-ink-400 hover:text-banana-400">
+            恢复 {hiddenNodes.size} 个隐藏节点
+          </button>
         ) : null}
         <Link href="/history" className="rounded border border-ink-700 px-2.5 py-1 text-[11px] text-ink-200 hover:border-banana-500 hover:text-banana-400">
-          历史与对比
+          历史画布
         </Link>
       </header>
 
@@ -340,31 +428,21 @@ export default function Workbench() {
           <code className="font-mono">.env.local</code> 填上 key，然后重启 dev server。
         </div>
       ) : null}
-      {benchProgress ? (
+      {progress ? (
         <div className="shrink-0 border-b border-banana-500/40 bg-banana-500/10 px-4 py-2 text-xs text-banana-200">
-          一键评测运行中 · 第 {benchProgress.index}/{benchProgress.total} 组：{benchProgress.label}
-          <span className="ml-2 text-banana-400/70">每组结果都会存进历史记录，跑完可并排对比</span>
+          第 {progress.index}/{progress.total} 条分支：{progress.label}
+          <span className="ml-2 text-banana-400/70">节点会实时长到画布上</span>
         </div>
       ) : null}
-      {benchDone ? (
-        <div className="flex shrink-0 items-center gap-3 border-b border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-xs text-emerald-200">
-          评测完成。
-          <Link href={`/history?benchmark=${benchDone}`} className="rounded border border-emerald-500/60 px-2 py-0.5 hover:bg-emerald-500/20">
-            查看对比表 →
-          </Link>
-        </div>
-      ) : null}
-      {error ? (
-        <div className="shrink-0 border-b border-rose-500/40 bg-rose-500/10 px-4 py-2 text-xs text-rose-200">{error}</div>
-      ) : null}
+      {error ? <div className="shrink-0 border-b border-rose-500/40 bg-rose-500/10 px-4 py-2 text-xs text-rose-200">{error}</div> : null}
 
-      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[320px_1fr_300px]">
+      <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[320px_1fr]">
         <aside className="scrollbar-thin min-h-0 overflow-y-auto border-r border-ink-800 p-3">
           <Controls
             settings={settings}
             onChange={patchSettings}
             running={running}
-            onRun={run}
+            onRun={runSingle}
             onCancel={cancel}
             onUpload={async (file) => setSourceImage(await fileToDataUrl(file))}
             sourceImage={sourceImage}
@@ -384,25 +462,42 @@ export default function Workbench() {
           </div>
         </aside>
 
-        <div className="flex min-h-0 min-w-0 flex-col gap-2 p-3">
-          <div className="min-h-0 flex-1">
-            {scene ? (
-              <Stage scene={scene} selectedId={selectedId} onSelect={setSelectedId} onChange={updateLayer} showOutlines={showOutlines} />
+        <div className="flex min-h-0 min-w-0 flex-col">
+          {board ? (
+            <BranchLegend
+              board={board}
+              hidden={hiddenBranches}
+              onToggle={toggleBranch}
+              onSolo={soloBranch}
+              onShowAll={() => setHiddenBranches(new Set())}
+            />
+          ) : null}
+
+          <div className="min-h-0 flex-1 p-3">
+            {board ? (
+              <BoardCanvas
+                board={board}
+                hiddenBranches={hiddenBranches}
+                hiddenNodes={hiddenNodes}
+                onToggleNode={toggleNode}
+                selectedNodeId={selectedNodeId}
+                onSelectNode={setSelectedNodeId}
+                onOpenScene={openScene}
+              />
             ) : (
-              <div className="checker flex h-full items-center justify-center rounded-lg border border-ink-800">
+              <div className="flex h-full items-center justify-center rounded-lg border border-ink-800">
                 <p className="max-w-sm px-6 text-center text-xs leading-relaxed text-ink-400">
-                  {running ? '正在跑管线，中间产物会实时出现在下面…' : '左边写提示词，选一条管线点运行；或者直接一键评测，把所有方案跑一遍。'}
+                  左边写提示词跑一次，或者直接一键评测。<br />
+                  每条分支的每个中间产物都会作为节点长到这张画布上，共享的上游只画一次。
                 </p>
               </div>
             )}
           </div>
 
-          {metrics ? <MetricRow metrics={metrics} /> : null}
-
-          <div className="scrollbar-thin max-h-56 shrink-0 overflow-y-auto rounded-lg border border-ink-800 bg-ink-900">
+          <div className="scrollbar-thin max-h-44 shrink-0 overflow-y-auto border-t border-ink-800 bg-ink-900">
             <div className="grid grid-cols-1 divide-y divide-ink-800 xl:grid-cols-2 xl:divide-x xl:divide-y-0">
               <div className="p-3">
-                <h3 className="mb-2 font-mono text-[10px] uppercase tracking-widest text-ink-400">管线步骤</h3>
+                <h3 className="mb-2 font-mono text-[10px] uppercase tracking-widest text-ink-400">当前分支步骤</h3>
                 <StepLog steps={steps} />
               </div>
               <div className="min-w-0 p-3">
@@ -412,58 +507,17 @@ export default function Workbench() {
             </div>
           </div>
         </div>
-
-        <aside className="scrollbar-thin min-h-0 overflow-y-auto border-l border-ink-800">
-          <Section
-            title="图层"
-            right={
-              <button onClick={() => setShowOutlines((v) => !v)} className="font-mono text-[9px] text-ink-400 hover:text-banana-400">
-                {showOutlines ? '隐藏边框' : '显示边框'}
-              </button>
-            }
-          >
-            {scene ? (
-              <LayerList
-                scene={scene}
-                selectedId={selectedId}
-                onSelect={setSelectedId}
-                onChange={updateLayer}
-                onReorder={reorderLayer}
-                onDelete={deleteLayer}
-              />
-            ) : (
-              <p className="text-xs text-ink-400">还没有图层。</p>
-            )}
-          </Section>
-
-          <Section title="属性">
-            <Inspector layer={selected} onChange={(patch) => selectedId && updateLayer(selectedId, patch)} />
-          </Section>
-
-          <Section title="导出">
-            <div className="grid grid-cols-3 gap-1.5">
-              <ExportBtn disabled={!scene} onClick={exportPng}>PNG</ExportBtn>
-              <ExportBtn disabled={!scene} onClick={() => scene && downloadSvg(`banana-${Date.now()}.svg`, scene)}>SVG</ExportBtn>
-              <ExportBtn disabled={!scene} onClick={() => scene && downloadJson(`banana-${Date.now()}.json`, scene)}>JSON</ExportBtn>
-            </div>
-            <p className="mt-2 text-[10px] leading-snug text-ink-400">
-              SVG 里的文字是 <code className="font-mono">&lt;text&gt;</code> 节点，不是描边路径 —— 这是整个 demo 的验收标准。
-            </p>
-          </Section>
-        </aside>
       </div>
-    </main>
-  )
-}
 
-function ExportBtn({ children, disabled, onClick }: { children: React.ReactNode; disabled?: boolean; onClick: () => void }) {
-  return (
-    <button
-      disabled={disabled}
-      onClick={onClick}
-      className="rounded border border-ink-700 px-2 py-1.5 font-mono text-[10px] text-ink-200 transition hover:border-banana-500 hover:text-banana-400 disabled:opacity-40 disabled:hover:border-ink-700 disabled:hover:text-ink-200"
-    >
-      {children}
-    </button>
+      {editingNode?.scene ? (
+        <SceneEditor
+          title={editingNode.label}
+          scene={editingNode.scene}
+          metrics={editingNode.metrics}
+          onChange={(scene) => saveSceneEdit(editingNode.id, scene)}
+          onClose={() => setEditing(null)}
+        />
+      ) : null}
+    </main>
   )
 }

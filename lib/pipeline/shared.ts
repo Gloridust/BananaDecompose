@@ -1,11 +1,18 @@
 'use client'
 
-import type { Artifact, RunStep, UsageInfo } from '../types'
+import type { Artifact, BoardNode, RunStep, UsageInfo } from '../types'
+
+/** A node emitted by a pipeline. The board owner merges by id and records which
+ *  branch asked for it, so a shared node ends up listing every branch it feeds. */
+export type NodeEmit = Omit<BoardNode, 'branches'>
 
 export type PipelineCtx = {
   signal?: AbortSignal
+  /** Which branch of the board this execution belongs to. */
+  branchId: string
   onStep: (step: RunStep) => void
   onArtifact: (artifact: Artifact) => void
+  onNode: (node: NodeEmit) => void
   /** Mutated as the run proceeds so the UI can show a live cost counter. */
   totals: { cost: number; ms: number }
 }
@@ -33,37 +40,64 @@ export async function api<T>(path: string, body: unknown, signal?: AbortSignal):
   return json as T
 }
 
-/** Wraps one unit of work with timing, cost accounting and step reporting. */
+/** Describes the board node a unit of work produces. */
+export type NodeSpec = {
+  id: string
+  kind: BoardNode['kind']
+  inputs: string[]
+}
+
+/** Wraps one unit of work with timing, cost accounting, step reporting and — when
+ *  a node spec is given — live node emission so the board fills in as it runs. */
 export async function track<T>(
   ctx: PipelineCtx,
   id: string,
   label: string,
-  fn: () => Promise<{ value: T; usage?: UsageInfo; detail?: string }>,
+  fn: () => Promise<{
+    value: T
+    usage?: UsageInfo
+    detail?: string
+    images?: { label: string; src: string }[]
+    summary?: string
+  }>,
+  node?: NodeSpec,
 ): Promise<T> {
   checkCancelled(ctx)
   const started = performance.now()
   ctx.onStep({ id, label, status: 'running' })
+  if (node) ctx.onNode({ ...node, label, status: 'running' })
+
   try {
-    const { value, usage, detail } = await fn()
+    const { value, usage, detail, images, summary } = await fn()
     const ms = Math.round(performance.now() - started)
     const cost = usage?.cost ?? 0
     ctx.totals.cost += cost
     ctx.totals.ms += ms
     ctx.onStep({ id, label, status: 'ok', ms, cost, detail })
+    if (node) ctx.onNode({ ...node, label, status: 'ok', ms, cost, detail, images, summary })
     return value
   } catch (err) {
     const ms = Math.round(performance.now() - started)
     if (err instanceof Cancelled || (err as Error)?.name === 'AbortError') {
       ctx.onStep({ id, label, status: 'skipped', ms, detail: '已取消' })
+      if (node) ctx.onNode({ ...node, label, status: 'skipped', ms, detail: '已取消' })
       throw new Cancelled()
     }
-    ctx.onStep({ id, label, status: 'error', ms, error: (err as Error).message })
+    const message = (err as Error).message
+    ctx.onStep({ id, label, status: 'error', ms, error: message })
+    if (node) ctx.onNode({ ...node, label, status: 'error', ms, error: message })
     throw err
   }
 }
 
-export function skip(ctx: PipelineCtx, id: string, label: string, detail: string) {
+export function skip(ctx: PipelineCtx, id: string, label: string, detail: string, node?: NodeSpec) {
   ctx.onStep({ id, label, status: 'skipped', detail })
+  if (node) ctx.onNode({ ...node, label, status: 'skipped', detail })
+}
+
+/** Emit or update a node outside of a tracked unit of work. */
+export function emit(ctx: PipelineCtx, node: NodeEmit) {
+  ctx.onNode(node)
 }
 
 /** 0..1000 [y0,x0,y1,x1] -> pixel rect on a w x h canvas. */

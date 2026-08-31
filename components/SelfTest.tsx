@@ -3,6 +3,8 @@
 import Link from 'next/link'
 import { useCallback, useEffect, useState } from 'react'
 import { chromaKeyMatte, dualRenderMatte, loadImage } from '@/lib/matte'
+import BoardCanvas from './Board'
+import type { Board } from '@/lib/types'
 
 // The matting maths is the load-bearing part of pipeline A, and it is the part
 // that costs money to test against the real model. So: build a subject with a
@@ -94,9 +96,54 @@ async function score(recovered: string, bounds: { x: number; y: number; w: numbe
   }
 }
 
+/** A board with the exact shape a three-arm sweep produces: one shared plan and
+ *  one shared plate fanning out into three matting chains. Verifies the layered
+ *  layout — depth columns, branch lanes, shared nodes centred — with no API spend. */
+function syntheticBoard(swatch: string): Board {
+  const arms = [
+    { id: 'a-dual', label: 'A · 双渲染差值' },
+    { id: 'a-chroma', label: 'A · 色键抠图' },
+    { id: 'a-vlm', label: 'A · VLM 分割掩码' },
+  ]
+  const all = arms.map((a) => a.id)
+
+  return {
+    id: 'selftest',
+    createdAt: 0,
+    prompt: '一张咖啡品鉴会的海报',
+    branchCount: arms.length,
+    nodeCount: 0,
+    totalMs: 0,
+    totalCost: 0,
+    models: { image: 'image', vision: 'vision', grounding: 'grounding' },
+    branches: arms.map((a) => ({
+      id: a.id,
+      label: a.label,
+      pipeline: 'compose' as const,
+      options: { matte: 'dual' as const, text: 'live' as const, aspectRatio: '1:1', resolution: '1K', maxElements: 2 },
+      status: 'ok' as const,
+      cost: 0,
+      ms: 0,
+    })),
+    nodes: [
+      { id: 'n:prompt', kind: 'prompt', label: '提示词', branches: [], inputs: [], status: 'ok', summary: '一张咖啡品鉴会的海报' },
+      { id: 'n:plan', kind: 'plan', label: '规划 Scene JSON', branches: all, inputs: ['n:prompt'], status: 'ok', summary: '· 手冲壶\n· 陶瓷杯\n「晨间萃取」' },
+      { id: 'n:plate', kind: 'plate', label: '背景板', branches: all, inputs: ['n:plan'], status: 'ok', images: [{ label: '背景板', src: swatch }] },
+      ...arms.flatMap((a) => [
+        { id: `n:${a.id}:renders`, kind: 'renders' as const, label: '独立渲染 ×2', branches: [a.id], inputs: ['n:plan'], status: 'ok' as const, images: [{ label: 'a', src: swatch }, { label: 'b', src: swatch }] },
+        { id: `n:${a.id}:cuts`, kind: 'cuts' as const, label: '抠图 ×2', branches: [a.id], inputs: [`n:${a.id}:renders`], status: 'ok' as const, images: [{ label: 'a', src: swatch }] },
+        { id: `n:${a.id}:scene`, kind: 'scene' as const, label: a.label, branches: [a.id], inputs: [`n:${a.id}:cuts`, 'n:plate'], status: 'ok' as const, images: [{ label: 'scene', src: swatch }], scene: { canvas: { width: 512, height: 512, background: '#111' }, layers: [] } },
+      ]),
+    ],
+  }
+}
+
 export default function SelfTest() {
   const [cases, setCases] = useState<Case[]>([])
   const [busy, setBusy] = useState(false)
+  const [demoBoard, setDemoBoard] = useState<Board | null>(null)
+  const [hiddenNodes, setHiddenNodes] = useState<Set<string>>(new Set())
+  const [hiddenBranches, setHiddenBranches] = useState<Set<string>>(new Set())
 
   const run = useCallback(async () => {
     setBusy(true)
@@ -115,6 +162,7 @@ export default function SelfTest() {
     results.push({ name: '色键抠图 (chroma)', ...(await score(chroma.src, chroma.bounds, truth)), recovered: chroma.src, truth: truthSrc })
 
     setCases(results)
+    setDemoBoard(syntheticBoard(truthSrc))
     setBusy(false)
   }, [])
 
@@ -144,6 +192,58 @@ export default function SelfTest() {
         <strong className="text-ink-200"> 这是算法上限</strong>：真实模型两次生成不会像这里一样像素级一致，实际误差会更大。
       </p>
 
+      {demoBoard ? (
+        <section className="mb-6">
+          <h2 className="mb-2 text-sm text-ink-50">节点画布布局自检</h2>
+          <p className="mb-2 max-w-2xl text-[11px] leading-relaxed text-ink-400">
+            一张三分支扫描该有的形状：<strong className="text-ink-200">一个规划节点 + 一个背景板节点，扇出到三条抠图链路</strong>。
+            共享上游只画一次 —— 这就是为什么对比表里每行的差异只来自被测变量。点分支按钮可以关掉整条链路。
+          </p>
+          <div className="mb-2 flex flex-wrap gap-1.5">
+            {demoBoard.branches.map((b) => {
+              const off = hiddenBranches.has(b.id)
+              return (
+                <button
+                  key={b.id}
+                  onClick={() =>
+                    setHiddenBranches((prev) => {
+                      const next = new Set(prev)
+                      if (next.has(b.id)) next.delete(b.id)
+                      else next.add(b.id)
+                      return next
+                    })
+                  }
+                  className={`rounded border px-2 py-1 text-[10px] ${
+                    off ? 'border-ink-800 text-ink-600 line-through' : 'border-ink-700 text-ink-200'
+                  }`}
+                >
+                  {b.label}
+                </button>
+              )
+            })}
+          </div>
+          <div className="h-[420px]">
+            <BoardCanvas
+              board={demoBoard}
+              hiddenBranches={hiddenBranches}
+              hiddenNodes={hiddenNodes}
+              onToggleNode={(id) =>
+                setHiddenNodes((prev) => {
+                  const next = new Set(prev)
+                  if (next.has(id)) next.delete(id)
+                  else next.add(id)
+                  return next
+                })
+              }
+              selectedNodeId={null}
+              onSelectNode={() => {}}
+              onOpenScene={() => {}}
+            />
+          </div>
+        </section>
+      ) : null}
+
+      <h2 className="mb-2 text-sm text-ink-50">抠图算法自检</h2>
       <div className="grid gap-4 lg:grid-cols-2">
         {cases.map((c) => {
           const good = c.meanAlphaError < 0.01

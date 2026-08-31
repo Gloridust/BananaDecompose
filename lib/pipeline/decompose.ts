@@ -11,8 +11,8 @@ import type {
   TextLayer,
   UsageInfo,
 } from '../types'
-import { boxToRect, checkCancelled, hexOr, mapLimit, skip, track, type PipelineCtx } from './shared'
-import { aspectToSize, segment } from './compose'
+import { boxToRect, checkCancelled, emit, hexOr, mapLimit, skip, track, type PipelineCtx } from './shared'
+import { PROMPT_NODE, aspectToSize, segment } from './compose'
 
 const SEG_CONCURRENCY = 2
 
@@ -24,7 +24,10 @@ const SEG_CONCURRENCY = 2
  * masks, and the image model does the inpainting that a local LaMa would do.
  * Ceiling is roughly PSNR 26 — good enough to edit, never pixel-exact.
  */
-export type DecomposeResult = { scene: Scene; source: string }
+export type DecomposeResult = { scene: Scene; source: string; tailNodes: string[] }
+
+/** Every decompose branch of a board starts from the same flat raster. */
+export const SOURCE_NODE = 'n:source'
 
 export async function runDecompose(
   ctx: PipelineCtx,
@@ -35,6 +38,7 @@ export async function runDecompose(
   let width: number
   let height: number
   let flat: string
+  const B = ctx.branchId
 
   // 1 ── source raster
   if (input.sourceImage) {
@@ -44,47 +48,76 @@ export async function runDecompose(
     height = size.height
     skip(ctx, 'flat', '来源图', `用户上传 · ${width}×${height}`)
     ctx.onArtifact({ label: '来源平图', src: flat, role: 'source' })
+    emit(ctx, {
+      id: SOURCE_NODE,
+      kind: 'source',
+      label: '来源平图',
+      detail: `用户上传 · ${width}×${height}`,
+      inputs: [PROMPT_NODE],
+      status: 'ok',
+      images: [{ label: '来源平图', src: flat }],
+    })
   } else {
     const planned = aspectToSize(opts.aspectRatio, opts.resolution)
-    flat = await track(ctx, 'flat', '生成一张拍平的成品图', async () => {
-      const res = await fetch('/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          prompt: flatPrompt(input.prompt, true),
-          aspectRatio: opts.aspectRatio,
-          resolution: opts.resolution,
-          model: models.image,
-        }),
-        signal: ctx.signal,
-      })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-      ctx.onArtifact({ label: '来源平图', src: json.images[0], role: 'source' })
-      return { value: json.images[0] as string, usage: json.usage as UsageInfo }
-    })
+    flat = await track(
+      ctx,
+      'flat',
+      '生成一张拍平的成品图',
+      async () => {
+        const res = await fetch('/api/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt: flatPrompt(input.prompt, true),
+            aspectRatio: opts.aspectRatio,
+            resolution: opts.resolution,
+            model: models.image,
+          }),
+          signal: ctx.signal,
+        })
+        const json = await res.json()
+        if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+        ctx.onArtifact({ label: '来源平图', src: json.images[0], role: 'source' })
+        return {
+          value: json.images[0] as string,
+          usage: json.usage as UsageInfo,
+          images: [{ label: '来源平图', src: json.images[0] }],
+        }
+      },
+      { id: SOURCE_NODE, kind: 'source', inputs: [PROMPT_NODE] },
+    )
     const size = await imageSize(flat)
     width = size.width || planned.width
     height = size.height || planned.height
   }
 
   // 2 ── read the layout back off the pixels
-  const analysis = await track(ctx, 'analyze', '读版面：元素 + 文字 + z-order', async () => {
-    const res = await fetch('/api/analyze', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image: flat, width, height, maxElements: opts.maxElements, model: opts.visionModel || undefined }),
-      signal: ctx.signal,
-    })
-    const json = await res.json()
-    if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-    const a = json.analysis as SceneAnalysis
-    return {
-      value: a,
-      usage: json.usage as UsageInfo,
-      detail: `${a.elements.length} 个元素 · ${a.texts.length} 段文字`,
-    }
-  })
+  const analyzeNode = `n:${B}:analysis`
+  const analysis = await track(
+    ctx,
+    'analyze',
+    '读版面：元素 + 文字 + z-order',
+    async () => {
+      const res = await fetch('/api/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: flat, width, height, maxElements: opts.maxElements, model: opts.visionModel || undefined }),
+        signal: ctx.signal,
+      })
+      const json = await res.json()
+      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+      const a = json.analysis as SceneAnalysis
+      const els = a.elements.map((e) => `· ${e.label}`).join('\n')
+      const txt = a.texts.map((t) => `「${t.content}」`).join('  ')
+      return {
+        value: a,
+        usage: json.usage as UsageInfo,
+        detail: `${a.elements.length} 个元素 · ${a.texts.length} 段文字`,
+        summary: [els, txt].filter(Boolean).join('\n') || '什么都没读出来',
+      }
+    },
+    { id: analyzeNode, kind: 'analysis', inputs: [SOURCE_NODE] },
+  )
 
   // 3 ── masks (or plain box crops if grounding declines)
   //
@@ -126,8 +159,28 @@ export async function runDecompose(
   } else {
     skip(ctx, 'segment', '分割掩码', '已关闭，元素按 bbox 矩形裁切')
   }
+  emit(ctx, {
+    id: `n:${B}:segment`,
+    kind: 'renders',
+    label: opts.useMasks ? `分割掩码 ×${analysis.elements.length}` : '分割掩码（已关闭）',
+    detail: opts.useMasks
+      ? `${Object.values(masks).filter((m) => m.mask).length}/${analysis.elements.length} 个拿到掩码`
+      : '元素退化为 bbox 矩形裁切',
+    inputs: [analyzeNode],
+    status: opts.useMasks ? 'ok' : 'skipped',
+  })
 
   // 4 ── lift each element out of the flat raster
+  const cutsNode = `n:${B}:cuts`
+  const cutShots: { label: string; src: string }[] = []
+  emit(ctx, {
+    id: cutsNode,
+    kind: 'cuts',
+    label: `切图 ×${analysis.elements.length}`,
+    inputs: [`n:${B}:segment`],
+    status: 'running',
+  })
+
   const elementLayers = await mapLimit(analysis.elements, SEG_CONCURRENCY, async (el, i) => {
     try {
       return await track(ctx, `cut-${el.id}`, `切图 ${i + 1}/${analysis.elements.length}：${el.label}`, async () => {
@@ -138,6 +191,15 @@ export async function runDecompose(
         const matte = hit?.mask ? await maskMatte(flat, hit.mask, box) : await cropBox(flat, box)
 
         ctx.onArtifact({ label: `${el.label} · 切出`, src: matte.src, role: 'cut' })
+        cutShots.push({ label: el.label, src: matte.src })
+        emit(ctx, {
+          id: cutsNode,
+          kind: 'cuts',
+          label: `切图 ×${analysis.elements.length}`,
+          inputs: [`n:${B}:segment`],
+          status: 'running',
+          images: [...cutShots],
+        })
 
         const layer: ImageLayer = {
           id: el.id,
@@ -167,29 +229,56 @@ export async function runDecompose(
 
   checkCancelled(ctx)
 
+  emit(ctx, {
+    id: cutsNode,
+    kind: 'cuts',
+    label: `切图 ×${analysis.elements.length}`,
+    detail: Object.values(masks).some((m) => m.mask) ? '掩码切出' : 'bbox 矩形裁切，无 alpha',
+    inputs: [`n:${B}:segment`],
+    status: 'ok',
+    images: [...cutShots],
+  })
+
   // 5 ── reconstruct what was underneath
+  const plateNode = `n:${B}:erase`
   let plate = flat
   if (opts.inpaintBackground) {
-    plate = await track(ctx, 'inpaint', '擦除元素与文字，重建背景板', async () => {
-      const res = await fetch('/api/erase', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          image: flat,
-          targets: analysis.elements.map((e) => e.label),
-          aspectRatio: opts.aspectRatio,
-          resolution: opts.resolution,
-          model: models.image,
-        }),
-        signal: ctx.signal,
-      })
-      const json = await res.json()
-      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
-      ctx.onArtifact({ label: '重建的背景板', src: json.image, role: 'plate' })
-      return { value: json.image as string, usage: json.usage as UsageInfo }
-    })
+    plate = await track(
+      ctx,
+      'inpaint',
+      '擦除元素与文字，重建背景板',
+      async () => {
+        const res = await fetch('/api/erase', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            image: flat,
+            targets: analysis.elements.map((e) => e.label),
+            aspectRatio: opts.aspectRatio,
+            resolution: opts.resolution,
+            model: models.image,
+          }),
+          signal: ctx.signal,
+        })
+        const json = await res.json()
+        if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`)
+        ctx.onArtifact({ label: '重建的背景板', src: json.image, role: 'plate' })
+        return {
+          value: json.image as string,
+          usage: json.usage as UsageInfo,
+          images: [{ label: '重建的背景板', src: json.image }],
+        }
+      },
+      { id: plateNode, kind: 'erase', inputs: [SOURCE_NODE, analyzeNode] },
+    )
   } else {
-    skip(ctx, 'inpaint', '背景重建', '已关闭，背景层仍是原始平图（元素会重影）')
+    skip(
+      ctx,
+      'inpaint',
+      '背景重建',
+      '已关闭，背景层仍是原始平图（元素会重影）',
+      { id: plateNode, kind: 'erase', inputs: [SOURCE_NODE] },
+    )
   }
 
   // 6 ── assemble
@@ -244,5 +333,6 @@ export async function runDecompose(
       layers,
     },
     source: flat,
+    tailNodes: [plateNode, cutsNode],
   }
 }
