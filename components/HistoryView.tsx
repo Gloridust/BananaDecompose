@@ -4,6 +4,7 @@ import Link from 'next/link'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { clearBoards, deleteBoard, getBoard, listBoards } from '@/lib/history'
 import { MetricTable } from './Metrics'
+import DiagnosticExport from './DiagnosticExport'
 import type { Board, BoardMeta, ComposeOptions, DecomposeOptions } from '@/lib/types'
 
 /** Each record is one whole canvas: every branch, every node, every intermediate. */
@@ -164,6 +165,7 @@ function BoardDetail({ board }: { board: Board }) {
       <div className="mb-3 flex flex-wrap items-baseline gap-3">
         <h3 className="font-mono text-[10px] uppercase tracking-widest text-ink-400">画布详情</h3>
         <p className="min-w-0 flex-1 truncate text-[11px] text-ink-200">{board.prompt}</p>
+        <DiagnosticExport board={board} />
         <Link href={`/?board=${board.id}`} className="shrink-0 font-mono text-[10px] text-banana-400 hover:underline">
           在画布上打开 →
         </Link>

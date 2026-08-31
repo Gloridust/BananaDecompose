@@ -6,6 +6,8 @@ import { chromaKeyMatte, dualRenderMatte, loadImage } from '@/lib/matte'
 import BoardCanvas from './Board'
 import GlyphTest from './GlyphTest'
 import SceneEditor from './SceneEditor'
+import { buildDiagnosticBundle } from '@/lib/diagnostics'
+import { listZip } from '@/lib/zip'
 import type { Board, Scene } from '@/lib/types'
 
 // The matting maths is the load-bearing part of pipeline A, and it is the part
@@ -128,6 +130,7 @@ function syntheticBoard(swatch: string): Board {
       pipeline: 'compose' as const,
       options: { matte: 'dual' as const, text: 'live' as const, aspectRatio: '1:1', resolution: '1K', maxElements: 2 },
       status: 'ok' as const,
+      sceneNodeId: `n:${a.id}:scene`,
       cost: 0,
       ms: 0,
     })),
@@ -173,6 +176,8 @@ export default function SelfTest() {
   const [hiddenNodes, setHiddenNodes] = useState<Set<string>>(new Set())
   const [hiddenBranches, setHiddenBranches] = useState<Set<string>>(new Set())
   const [editing, setEditing] = useState<Scene | null>(null)
+  const [bundle, setBundle] = useState<{ entries: { path: string; size: number; crcOk: boolean }[]; totalBytes: number } | null>(null)
+  const [bundleError, setBundleError] = useState<string | null>(null)
 
   const run = useCallback(async () => {
     setBusy(true)
@@ -262,6 +267,42 @@ export default function SelfTest() {
               )
             })}
           </div>
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <button
+              onClick={async () => {
+                setBundleError(null)
+                try {
+                  // Round-trip it: an archive no tool can open fails silently
+                  // until someone else tries to unpack it.
+                  setBundle(await listZip(await buildDiagnosticBundle(demoBoard, { maxDim: 256, compressOpaque: true })))
+                } catch (err) {
+                  setBundleError((err as Error).message)
+                }
+              }}
+              className="rounded border border-ink-700 px-2 py-1 text-[10px] text-ink-200 hover:border-banana-500 hover:text-banana-400"
+            >
+              诊断包自检（打包后解回来验 CRC）
+            </button>
+            {bundle ? (
+              <span
+                className={`font-mono text-[10px] ${
+                  bundle.entries.every((e) => e.crcOk) ? 'text-emerald-400' : 'text-rose-400'
+                }`}
+              >
+                {bundle.entries.length} 个文件 · {(bundle.totalBytes / 1024).toFixed(0)} KB ·{' '}
+                {bundle.entries.every((e) => e.crcOk) ? 'CRC 全部通过' : 'CRC 校验失败'} ·{' '}
+                {bundle.entries.every((e) => /^[\x20-\x7e]+$/.test(e.path)) ? '路径全为 ASCII' : '⚠ 路径含非 ASCII'}
+              </span>
+            ) : null}
+            {bundleError ? <span className="font-mono text-[10px] text-rose-400">{bundleError}</span> : null}
+          </div>
+
+          {bundle ? (
+            <pre className="scrollbar-thin mb-2 max-h-32 overflow-auto rounded border border-ink-800 bg-ink-950 p-2 font-mono text-[9px] leading-relaxed text-ink-400">
+              {bundle.entries.map((e) => `${e.crcOk ? '✓' : '✗'} ${e.path}  ${e.size}B`).join('\n')}
+            </pre>
+          ) : null}
+
           <div className="h-[420px]">
             <BoardCanvas
               board={demoBoard}

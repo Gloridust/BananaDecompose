@@ -6,6 +6,7 @@ import Controls, { DEFAULT_SETTINGS, type Settings } from './Controls'
 import BoardCanvas from './Board'
 import BranchLegend from './BranchLegend'
 import BoardBar from './BoardBar'
+import DiagnosticExport from './DiagnosticExport'
 import SceneEditor from './SceneEditor'
 import BenchmarkPanel from './BenchmarkPanel'
 import { ArtifactStrip, StepLog } from './Panels'
@@ -587,6 +588,7 @@ export default function Workbench() {
             恢复 {hiddenNodes.size} 个隐藏节点
           </button>
         ) : null}
+        <DiagnosticExport board={board} disabled={running} />
         <Link href="/history" className="rounded border border-ink-700 px-2.5 py-1 text-[11px] text-ink-200 hover:border-banana-500 hover:text-banana-400">
           历史画布
         </Link>

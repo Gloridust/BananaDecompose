@@ -56,7 +56,7 @@ npm run dev
 | [抠图](./doc/matting.md) | 三种 alpha 恢复策略与实测数据 |
 | [文字回收](./doc/text-recovery.md) | 字形测量、字号字距拟合、字体判定、原始笔画保留 |
 | [API](./doc/api.md) | 六个路由的输入输出与超时降级 |
-| [界面](./doc/ui.md) | 画布手势、分支开关、编辑器、评测与历史 |
+| [界面](./doc/ui.md) | 画布手势、分支开关、编辑器、评测、历史、诊断包 |
 | [设计决策](./doc/decisions.md) | 每个取舍的理由，以及**被推翻过的做法** |
 
 ## 目录结构
@@ -73,6 +73,8 @@ lib/matte.ts             浏览器端 alpha 恢复、按区域合成、裁图放
 lib/glyph.ts             字形测量与拟合：Otsu 分离墨迹、字号字距解算、字体回测
 lib/retype.ts            保留原始笔画的图层改字：按原样式重绘
 lib/edit-region.ts       圈选重绘：裁片带周边 → 模型重画 → 羽化 → 落成独立图层
+lib/diagnostics.ts       诊断包：整张画布的节点图、逐层拆解、配置与指标打成 zip
+lib/zip.ts               无依赖的 store-only ZIP 读写（PNG 已压过，再 deflate 无意义）
 lib/metrics.ts           从产出像素里算指标：软边、存活面积、底色残留、重建 PSNR/L1
 lib/board.ts             分层 DAG 布局：深度分列、分支分道、共享节点居中
 lib/benchmark.ts         一键评测的方案矩阵与成本估算
