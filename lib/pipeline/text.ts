@@ -17,8 +17,10 @@ import type { ImageLayer, Layer, SceneAnalysis, TextLayer, TextMode, UsageInfo }
 
 export type RecoveredText = {
   layer: Layer
-  /** Ink bounds in image pixels — the plate compositor patches exactly here. */
+  /** Measured ink bounds in image pixels — the tight patch region. */
   inkBox: { x: number; y: number; w: number; h: number } | null
+  /** The model's own box, in pixels. Loose, but it still has to be erased. */
+  coarseBox: { x: number; y: number; w: number; h: number }
   fitted: boolean
 }
 
@@ -81,8 +83,10 @@ export async function recoverText(
       }
     }
 
+    const coarseBox = boxToRect(t.box, size.width, size.height)
+
     if (!ink) {
-      return { layer: fromBox(t, content, family, weight, italic, size, i), inkBox: null, fitted: false }
+      return { layer: fromBox(t, content, family, weight, italic, size, i), inkBox: null, coarseBox, fitted: false }
     }
 
     // Score the candidate faces against the measured ink — but only act on the
@@ -120,7 +124,7 @@ export async function recoverText(
         retype: { text: content, styleRef: ink.styleRef, color: ink.color },
         provenance: `原始笔画抠出 · 像素级一致 · 改字将按原样式重绘（识别为「${content}」）`,
       }
-      return { layer, inkBox: ink.box, fitted: true }
+      return { layer, inkBox: ink.box, coarseBox, fitted: true }
     }
 
     const fit = fitText(content, best.family, best.weight, italic, ink.box)
@@ -157,7 +161,7 @@ export async function recoverText(
         .join(' · '),
     }
 
-    return { layer, inkBox: ink.box, fitted: true }
+    return { layer, inkBox: ink.box, coarseBox, fitted: true }
   })
 
   if (opts.fitGlyphs) notes.push(`${fittedCount}/${deduped.length} 段量到字形`)

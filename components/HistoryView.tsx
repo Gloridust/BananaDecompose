@@ -217,5 +217,5 @@ function optionSummary(options: ComposeOptions | DecomposeOptions, pipeline: str
     return `${o.matte} · ${o.text === 'live' ? '文字未入像素' : '文字回收'}`
   }
   const o = options as DecomposeOptions
-  return `掩码${o.useMasks ? '开' : '关'} · 重绘${o.inpaintBackground ? '开' : '关'}`
+  return `掩码${o.useMasks ? '开' : '关'} · ${o.fitGlyphs ? '字形贴合' : '模型框'} · ${o.textMode === 'pixel' ? '原始笔画' : '重排'}`
 }

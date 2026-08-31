@@ -158,9 +158,11 @@ export async function runDecompose(
     { id: textNode, kind: 'text', inputs: [analyzeNode] },
   )
 
-  const textRegions = recovered.texts
-    .map((t) => t.inkBox)
-    .filter((b): b is { x: number; y: number; w: number; h: number } => Boolean(b))
+  // Every run has to be erased from the plate, measured or not. A precise ink
+  // box makes a tight patch and a coarse model box makes a loose one, but
+  // leaving a run un-erased puts a second copy of it under the layer that
+  // replaced it — which is the one outcome that is never acceptable.
+  const textRegions = recovered.texts.map((t) => t.inkBox ?? t.coarseBox).filter((b) => b.w > 1 && b.h > 1)
 
   // 4 ── masks. One request per object: masks come back as base64 text, so
   // batching them was measured at >170s before timing out.
@@ -218,7 +220,7 @@ export async function runDecompose(
   const elementRegions = masked.map((el) => boxToRect(masks[el.id]!.box ?? el.box, width, height))
 
   let erased: string | null = null
-  if (opts.inpaintBackground && (textRegions.length || elementRegions.length)) {
+  if (textRegions.length || elementRegions.length) {
     erased = await tryTrack(
       ctx,
       'inpaint',
@@ -246,7 +248,7 @@ export async function runDecompose(
       ctx,
       'inpaint',
       '背景重建',
-      '已关闭，背景层保留原图（文字与元素会重影）',
+      '没有要抬走的东西，背景沿用原图',
       { id: plateNode, kind: 'erase', inputs: [SOURCE_NODE, textNode] },
     )
   }
@@ -350,7 +352,7 @@ export async function runDecompose(
     locked: false,
     src: plate,
     matte: 'none',
-    provenance: erased ? '按区域合成：只在文字与元素处采用重绘' : '原始平图（未重建）',
+    provenance: erased ? '按区域合成：只在文字与元素处采用重绘' : '重建被拒，沿用原始平图',
   }
 
   const elements = elementLayers.filter((l): l is ImageLayer => Boolean(l))
@@ -359,12 +361,8 @@ export async function runDecompose(
   // Say out loud what a degraded run produced, so a doubled poster reads as a
   // recorded consequence of the settings rather than as a mystery.
   const warnings: string[] = []
-  const reset = recovered.texts.filter((t) => t.layer.type === 'text').length
-  if (!erased && reset) {
-    warnings.push(`背景未重建，${reset} 段重排文字会与原图上的文字重影`)
-  }
-  if (!erased && opts.inpaintBackground) {
-    warnings.push('重建被拒，背景沿用原图')
+  if (!erased && (textRegions.length || elementRegions.length)) {
+    warnings.push('背景重建被拒，背景仍带原文字与元素，图层会重影')
   }
   if (!masked.length && analysis.elements.length) {
     warnings.push(`${analysis.elements.length} 个元素没有掩码，留在背景里，没有可编辑元素层`)

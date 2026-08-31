@@ -60,44 +60,28 @@ export const VARIANTS: BenchmarkVariant[] = [
     imageCalls: (n) => 1 + 2 * n + 1,
   },
   {
-    id: 'b-mask',
-    label: 'B · 掩码 + 重绘背景',
-    note: '完整的事后拆解：读版面 → 掩码切图 → 重绘补洞。',
+    id: 'b-full',
+    label: 'B · 完整拆解',
+    note: '掩码切元素 + 字形贴合 + 保留原始笔画。推荐配置：背景干净，文字像素级一致。',
     pipeline: 'decompose',
-    decompose: { useMasks: true, inpaintBackground: true, fitGlyphs: true, refineText: true, textMode: 'pixel' },
+    decompose: { useMasks: true, fitGlyphs: true, refineText: true, textMode: 'pixel' },
+    imageCalls: () => 1 + 1,
+  },
+  {
+    id: 'b-vector',
+    label: 'B · 文字重排为真文本',
+    note: '同上，但文字用 web 字体重排而不是保留原始笔画。量化「换来可直接改字」要付出多少保真度。',
+    pipeline: 'decompose',
+    decompose: { useMasks: true, fitGlyphs: true, refineText: true, textMode: 'vector' },
     imageCalls: () => 1 + 1,
   },
   {
     id: 'b-noglyph',
     label: 'B · 关掉字形贴合',
-    note: '文字只用模型给的框和字号，不量墨迹，重排为 web 字体。隔离出「本地字形贴合」到底纠正了多少偏移。',
+    note: '文字只用模型给的框和字号，不量墨迹，重排为 web 字体。背景照样擦干净 —— 隔离出的是位置偏差，不是重影。',
     pipeline: 'decompose',
-    decompose: { useMasks: true, inpaintBackground: true, fitGlyphs: false, refineText: false, textMode: 'vector' },
+    decompose: { useMasks: true, fitGlyphs: false, refineText: false, textMode: 'vector' },
     imageCalls: () => 1 + 1,
-  },
-  {
-    id: 'b-nomask',
-    label: 'B · 掩码关，仅重绘',
-    note: '没有掩码就不生成元素层，元素留在背景里。隔离出掩码这一步到底贡献了多少。',
-    pipeline: 'decompose',
-    decompose: { useMasks: false, inpaintBackground: true, fitGlyphs: true, refineText: true, textMode: 'pixel' },
-    imageCalls: () => 1 + 1,
-  },
-  {
-    id: 'b-raw',
-    label: 'B · 全关（下限对照）',
-    note: '掩码、重绘、字形贴合全关，文字重排为 web 字体。背景仍带原文字，重排的文字必然与它重影 —— 这就是地板，用来标定其他几档的意义。',
-    pipeline: 'decompose',
-    decompose: {
-      useMasks: false,
-      inpaintBackground: false,
-      fitGlyphs: false,
-      refineText: false,
-      // Pinned: keeping the original glyphs would land them back exactly where
-      // they came from and hide the very failure this arm exists to show.
-      textMode: 'vector',
-    },
-    imageCalls: () => 1,
   },
 ]
 
@@ -121,6 +105,8 @@ export function estimate(selected: string[], composeElements: number, decomposeE
       images += arm.imageCalls(composeElements) - reuse
       if (arm.reusesPlate) plateSeen = true
     } else {
+      // Only the first decompose arm pays for the shared source raster; every
+      // arm still pays for its own background rebuild.
       images += arm.imageCalls(decomposeElements) - (sourceSeen ? 1 : 0)
       sourceSeen = true
     }

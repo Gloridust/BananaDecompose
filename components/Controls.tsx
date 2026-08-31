@@ -20,7 +20,7 @@ export const DEFAULT_SETTINGS: Settings = {
   concurrency: 4,
   prompt: '一张咖啡品鉴会的海报：暖褐色纸质背景，一只手冲壶、一个陶瓷杯、几颗散落的咖啡豆，标题「晨间萃取」，副标题「周六 9:00 · 三号仓库」',
   compose: { matte: 'dual', text: 'live', aspectRatio: '4:5', resolution: '1K', maxElements: 4, visionModel: '' },
-  decompose: { aspectRatio: '4:5', resolution: '1K', useMasks: true, inpaintBackground: true, fitGlyphs: true, refineText: true, textMode: 'pixel', maxElements: 6, groundingModel: '', visionModel: '' },
+  decompose: { aspectRatio: '4:5', resolution: '1K', useMasks: true, fitGlyphs: true, refineText: true, textMode: 'pixel', maxElements: 6, groundingModel: '', visionModel: '' },
 }
 
 const PIPELINES: { id: PipelineId; label: string; blurb: string }[] = [
@@ -231,17 +231,17 @@ function DecomposeControls({
         )}
       </Field>
 
+      <p className="rounded border border-ink-800 bg-ink-900 px-2 py-1.5 text-[10px] leading-snug text-ink-400">
+        <span className="text-ink-200">背景一定会重绘。</span>
+        文字和元素抬走后留下的洞交给 Nano Banana 补，只在这些区域合成、其余像素与原图逐位一致。
+        底板上还留着已经被抬走的东西，就不是分层文件，只是一张图上面浮着它自己的副本。
+      </p>
+
       <Toggle
         checked={opts.useMasks}
         onChange={(v) => onChange({ useMasks: v })}
         label="请求分割掩码"
-        note="关掉就只按 bbox 矩形裁切 —— 这是拆解精度差距最大的一个开关。"
-      />
-      <Toggle
-        checked={opts.inpaintBackground}
-        onChange={(v) => onChange({ inpaintBackground: v })}
-        label="重绘补全背景"
-        note="把文字和元素抬走后留下的洞交给 Nano Banana 补。只在这些区域合成，其余像素与原图完全一致。"
+        note="关掉就拿不到可编辑元素层 —— 元素会留在背景里。这是拆解精度差距最大的一个开关。"
       />
       <Toggle
         checked={opts.fitGlyphs}

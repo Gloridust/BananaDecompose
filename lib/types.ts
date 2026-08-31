@@ -124,8 +124,6 @@ export type DecomposeOptions = {
   visionModel?: string
   /** Ask the vision model for per-element segmentation masks (slower, sharper). */
   useMasks: boolean
-  /** Use the image model to inpaint the holes left behind by lifted elements. */
-  inpaintBackground: boolean
   /** Measure glyph pixels locally instead of trusting the model's box and size. */
   fitGlyphs: boolean
   /** Re-read each run from a zoomed crop for content, face and weight. */
